@@ -2169,7 +2169,14 @@ begin
 	OBJ_PRIO := SPR_PIX_DATA(8 downto 7);
 
 	PRIO1 := BG1_PIX_DATA(11);
+	
+	-- HD Mode 7 EXTBG: Priority 2 must track the active pixel phase
+	if M7_HD = '1' and BG_MODE_SYNC = "111" and DOT_CLK = '0' then
+		PRIO2 := M7_PIX_DATA2(7);
+	else
 	PRIO2 := BG2_PIX_DATA(7);
+	end if;
+	
 	PRIO3 := BG3_PIX_DATA(5);
 	PRIO4 := BG4_PIX_DATA(5);
 	
@@ -2468,23 +2475,20 @@ begin
 		elsif SPR_PIX_DATA(3 downto 0) /= "0000" and OBJPR2EN = '1' then
 			CGRAM_FETCH_ADDR <= "1" & SPR_PIX_DATA(6 downto 0);
 			MATH := CGADSUB(4) and SPR_PIX_DATA(6);
-		elsif M7_BG2_COLOR(6 downto 0) /= "0000000" and BGPR1EN(1) = '1' and M7EXTBG = '1'
-		      and (M7_HD = '0' or (M7_PIX_DATA2(6 downto 0) /= "0000000" and BG2_PIX_DATA(6 downto 0) /= "0000000")) then
+		elsif M7_BG2_COLOR(6 downto 0) /= "0000000" and BGPR1EN(1) = '1' and M7EXTBG = '1' then
 			CGRAM_FETCH_ADDR <= "0" & M7_BG2_COLOR(6 downto 0);
 			MATH := CGADSUB(1);
 		elsif SPR_PIX_DATA(3 downto 0) /= "0000" and OBJPR1EN = '1' then
 			CGRAM_FETCH_ADDR <= "1" & SPR_PIX_DATA(6 downto 0);
 			MATH := CGADSUB(4) and SPR_PIX_DATA(6);
-		elsif M7_BG1_COLOR /= "00000000" and BGPR0EN(0) = '1'
-		      and (M7_HD = '0' or (M7_PIX_DATA2 /= "00000000" and BG1_PIX_DATA(7 downto 0) /= "00000000")) then
+		elsif M7_BG1_COLOR /= "00000000" and BGPR0EN(0) = '1' then
 			CGRAM_FETCH_ADDR <= M7_BG1_COLOR;
 			DCM := CGWSEL(0);
 			MATH := CGADSUB(0);
 		elsif SPR_PIX_DATA(3 downto 0) /= "0000" and OBJPR0EN = '1' then
 			CGRAM_FETCH_ADDR <= "1" & SPR_PIX_DATA(6 downto 0);
 			MATH := CGADSUB(4) and SPR_PIX_DATA(6);
-		elsif M7_BG2_COLOR(6 downto 0) /= "0000000" and BGPR0EN(1) = '1' and M7EXTBG = '1'
-		      and (M7_HD = '0' or (M7_PIX_DATA2(6 downto 0) /= "0000000" and BG2_PIX_DATA(6 downto 0) /= "0000000")) then
+		elsif M7_BG2_COLOR(6 downto 0) /= "0000000" and BGPR0EN(1) = '1' and M7EXTBG = '1' then
 			CGRAM_FETCH_ADDR <= "0" & M7_BG2_COLOR(6 downto 0);
 			MATH := CGADSUB(1);
 		else
@@ -2528,11 +2532,13 @@ begin
 					HALF := CGADSUB(6) and MAIN_EN and not (SUB_BD and CGWSEL(1));
 					SUB_MATH_EN := CGWSEL(1) and not SUB_BD;
 
-					-- HD Mode 7: both DOT_CLK phases render independent sub-pixels,
-					-- so PREV_COLOR is the other sub-pixel, not a real sub-screen layer.
-					-- Force fixed-color path to prevent adding two sub-pixels together.
+					-- HD Mode 7: both DOT_CLK phases render independent main-screen
+					-- sub-pixels, so PREV_COLOR holds the other sub-pixel's color,
+					-- not a real sub-screen composite.
+					-- Use fixed color instead.
 					if M7_HD = '1' and BG_MODE_SYNC = "111" then
 						SUB_MATH_EN := '0';
+						HALF := '0'; -- Prevent 50% brightness cut when sub-math is hijacked
 					end if;
 
 					if MAIN_EN = '0' then
