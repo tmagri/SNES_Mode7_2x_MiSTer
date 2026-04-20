@@ -8,8 +8,8 @@ This version is experimental and has limited support.
 It will not be pushed to `master` in its current form, since other pending changes may still be breaking.
 
 Current status:
-* Mode 7 2x works.
-* For progressive TVs, enable deinterlacing.
+* Mode 7 Wide-Res works. It doubles the horizontal resolution of Mode 7 backgrounds by rendering two sub-pixels per dot clock using dual-port VRAM. Vertical resolution remains unchanged, so it is not a full 2x scale — it is closer to 512×224 for the Mode 7 layer while sprites and other layers remain at native resolution.
+* For progressive TVs, enable the M7 WR Deinterlace option. Wide-Res outputs two sub-pixels per dot as alternating fields (similar to 448i interlace), which can cause flickering or combing on progressive displays. The deinterlace filter bobs the fields together to produce a clean image.
 * Overclock fix for Top Gear 3000 works, albeit with minor visual glitches.
 
 For regular support, please use the main MiSTer community channels.

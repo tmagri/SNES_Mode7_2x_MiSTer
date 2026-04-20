@@ -328,8 +328,8 @@ parameter CONF_STR = {
 	"P1oA,Force 256px,Off,On;",
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
-	"P1O[58],Mode 7 (x2),Off,On;",
-	"P1O[59],M7 Deinterlace,Off,On;",
+	"P1O[58],Mode 7 Wide-Res,Off,On;",
+	"P1O[59],M7 WR Deinterlace,Off,On;",
 	"P1-;",
 	"P1OJK,Stereo Mix,None,25%,50%,100%;", 
 
