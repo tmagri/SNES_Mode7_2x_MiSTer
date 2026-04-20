@@ -61,7 +61,6 @@ entity SPPU is
 		BG_EN			: in std_logic_vector(4 downto 0);
 
 		M7_HD			: in std_logic;
-		M7_DEINT		: in std_logic;
 
 		SS_A			: in std_logic_vector(7 downto 0);
 		SS_DO			: out std_logic_vector(7 downto 0)
@@ -1351,12 +1350,9 @@ begin
 
 				if H_CNT = M7_XY_LATCH then
 					-- Mode 7 V2X: on odd fields, shift by half a scanline vertically.
-					-- Only when NOT deinterlacing: the field offset is for 448i output
-					-- on interlace-capable displays. When M7_DEINT is active, output
-					-- is progressive 224p so both fields must render identically
-					-- (any offset causes inter-frame shimmer since VGA_F1=0 means
-					-- the scaler has no field info to deinterlace).
-					if M7_HD = '1' and FIELD = '1' and M7_DEINT = '0' then
+					-- INTERLACE is asserted for HD Mode 7, so VGA_F1 toggles with FIELD
+					-- and the MiSTer scaler deinterlaces the two fields into 448p.
+					if M7_HD = '1' and FIELD = '1' then
 						M7_TEMP_X <= (resize(signed(M7X), M7_TEMP_X'length) sll 8)
 						             + resize(shift_right(resize(signed(M7B), 27), 1), 27);
 						M7_TEMP_Y <= (resize(signed(M7Y), M7_TEMP_Y'length) sll 8)
@@ -2708,7 +2704,8 @@ HIGH_RES <= HIRES or (PSEUDOHIRES and not BLEND)
 				    and BG_MODE_SYNC(2) and BG_MODE_SYNC(1) and BG_MODE_SYNC(0));
 V224 <= not OVERSCAN;
 FIELD_OUT <= FIELD;
-INTERLACE <= BGINTERLACE;
+INTERLACE <= BGINTERLACE
+				or (M7_HD and BG_MODE_SYNC(2) and BG_MODE_SYNC(1) and BG_MODE_SYNC(0));
 
 
 -- save states

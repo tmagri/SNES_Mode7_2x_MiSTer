@@ -329,7 +329,7 @@ parameter CONF_STR = {
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
 	"P1O[58],Mode 7 Wide-Res,Off,On;",
-	"P1O[59],M7 WR Deinterlace,Off,On;",
+	"P1O[59],M7 WR Bob Deint.,Off,On;",
 	"P1-;",
 	"P1OJK,Stereo Mix,None,25%,50%,100%;", 
 
@@ -726,7 +726,6 @@ main main
 `endif
 
 	.M7_HD(M7_HD),
-	.M7_DEINT(M7_DEINT),
 
 	// MSU register handling
 	.MSU_TRACK_NUM(msu_track_num),

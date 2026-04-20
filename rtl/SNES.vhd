@@ -117,7 +117,6 @@ entity SNES is
 		DBG_CPU_EN	: in std_logic;
 
 		M7_HD			: in std_logic;
-		M7_DEINT		: in std_logic;
 
 		AUDIO_L		: out std_logic_vector(15 downto 0);
 		AUDIO_R		: out std_logic_vector(15 downto 0)
@@ -367,7 +366,6 @@ begin
 		BG_EN			=> DBG_BG_EN,
 
 		M7_HD			=> M7_HD,
-		M7_DEINT		=> M7_DEINT,
 
 		SS_A		=> INT_CA(7 downto 0),
 		SS_DO		=> SS_PPU_DO

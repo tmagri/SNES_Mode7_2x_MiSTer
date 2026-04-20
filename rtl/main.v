@@ -104,7 +104,6 @@ module main (
 	input             DBG_CPU_EN,
 
 	input             M7_HD,
-	input             M7_DEINT,
 
 	input             TURBO,
 	output            TURBO_ALLOW,
@@ -286,7 +285,6 @@ SNES SNES
 	.DBG_CPU_EN(DBG_CPU_EN),
 
 	.m7_hd(M7_HD),
-	.m7_deint(M7_DEINT),
 
 	.turbo(TURBO),
 	
