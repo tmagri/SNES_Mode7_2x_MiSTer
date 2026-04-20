@@ -295,10 +295,13 @@ signal SPR_PIX_CNT 		: unsigned(2 downto 0);
 
 -- CRAM
 signal CGRAM_Q 			: std_logic_vector(14 downto 0);
+signal CGRAM_Q_B 			: std_logic_vector(14 downto 0);
 signal CGRAM_D 			: std_logic_vector(14 downto 0);
 signal CGRAM_WE			: std_logic;
 signal CGRAM_FETCH_ADDR : std_logic_vector(7 downto 0);
+signal CGRAM_SUB_FETCH_ADDR : std_logic_vector(7 downto 0);
 signal CGRAM_ADDR 		: std_logic_vector(7 downto 0);
+signal CGRAM_B_ADDR		: std_logic_vector(7 downto 0);
 signal CGRAM_ADDR_INC	: std_logic;
 
 signal CGRAM_ADDR_CLR	: unsigned(7 downto 0);
@@ -374,15 +377,18 @@ port map(
 	wren_a	 => CGRAM_WE,
 	q_a		 => CGRAM_Q,
 	
-	address_b => std_logic_vector(CGRAM_ADDR_CLR),
+	address_b => CGRAM_B_ADDR,
 	data_b	 => std_logic_vector(CGRAM_ADDR_CLR(6 downto 0)) & std_logic_vector(CGRAM_ADDR_CLR),
-	wren_b	 => not RST_N
+	wren_b	 => not RST_N,
+	q_b		 => CGRAM_Q_B
 );
 
 CGRAM_ADDR_CLR <= CGRAM_ADDR_CLR + 1 when rising_edge(CLK);
 
 CGRAM_ADDR <= CGRAM_FETCH_ADDR when BG_MATH = '1' and FORCE_BLANK = '0' else 
 				  CGADD(8 downto 1);
+CGRAM_B_ADDR <= CGRAM_SUB_FETCH_ADDR when BG_MATH = '1' and FORCE_BLANK = '0' and RST_N = '1' else
+				  std_logic_vector(CGRAM_ADDR_CLR);
 CGRAM_D <= DI(6 downto 0) & CGRAM_Lsb;
 CGRAM_WE <= '1' when CGADD(0) = '1' and PAWR_N = '0' and PA = x"22" and SYSCLK_CE = '1' else '0';
 
@@ -2104,6 +2110,7 @@ variable COLOR	: std_logic_vector(14 downto 0);
 variable COLOR_MASK : std_logic_vector(4 downto 0);
 variable MATH_R, MATH_G, MATH_B	: unsigned(4 downto 0);
 variable HALF : std_logic;
+variable M7_SUB_BD : std_logic;
 variable M7_BG1_COLOR : std_logic_vector(7 downto 0);
 variable M7_BG2_COLOR : std_logic_vector(7 downto 0);
 begin
@@ -2498,6 +2505,24 @@ begin
 		end if;
 	end if;
 
+	-- HD Mode 7: Compute sub-screen sprite CGRAM address for color math.
+	-- Standard Mode 7 uses the sub-screen (TS) to render sprites without BG1,
+	-- then color math adds the sub-screen onto the main-screen terrain.
+	-- HD Mode 7 uses both DOT_CLK phases for terrain, so we read the sub-screen
+	-- sprite color via CGRAM port B in parallel.
+	if M7_HD = '1' and BG_MODE_SYNC = "111" then
+		if SPR_PIX_DATA(3 downto 0) /= "0000" and TS(4) = '1' and sub_dis(4) = '0' and BG_EN(4) = '1' then
+			CGRAM_SUB_FETCH_ADDR <= "1" & SPR_PIX_DATA(6 downto 0);
+			M7_SUB_BD := '0';
+		else
+			CGRAM_SUB_FETCH_ADDR <= (others => '0');
+			M7_SUB_BD := '1';
+		end if;
+	else
+		CGRAM_SUB_FETCH_ADDR <= (others => '0');
+		M7_SUB_BD := '1';
+	end if;
+
 	
 	if RST_N = '0' then
 		WINDOW_X <= (others => '0');
@@ -2524,22 +2549,27 @@ begin
 
 			if BG_MATH = '1' then
 				if DOT_CLKF_CE = '1' then
-					SUB_BD <= BD;
+					if M7_HD = '1' and BG_MODE_SYNC = "111" then
+						SUB_BD <= M7_SUB_BD;
+						-- Compute math variables at DOT_CLKF_CE for HD Mode 7
+						-- so the right sub-pixel gets correct color math.
+						MATH_EN := MATH;
+						HALF := CGADSUB(6) and MAIN_EN and not (M7_SUB_BD and CGWSEL(1));
+						SUB_MATH_EN := CGWSEL(1) and not M7_SUB_BD;
+						if MAIN_EN = '0' then
+							COLOR_MASK := "00000";
+						else
+							COLOR_MASK := "11111";
+						end if;
+					else
+						SUB_BD <= BD;
+					end if;
 				end if;
 
 				if DOT_CLKR_CE = '1' then
 					MATH_EN := MATH;
 					HALF := CGADSUB(6) and MAIN_EN and not (SUB_BD and CGWSEL(1));
 					SUB_MATH_EN := CGWSEL(1) and not SUB_BD;
-
-					-- HD Mode 7: both DOT_CLK phases render independent main-screen
-					-- sub-pixels, so PREV_COLOR holds the other sub-pixel's color,
-					-- not a real sub-screen composite.
-					-- Use fixed color instead.
-					if M7_HD = '1' and BG_MODE_SYNC = "111" then
-						SUB_MATH_EN := '0';
-						HALF := '0'; -- Prevent 50% brightness cut when sub-math is hijacked
-					end if;
 
 					if MAIN_EN = '0' then
 						COLOR_MASK := "00000";
@@ -2554,6 +2584,7 @@ begin
 					else
 						COLOR := CGRAM_Q;
 					end if;
+
 					PREV_COLOR <= COLOR;
 
 					if PSEUDOHIRES = '1' and BLEND = '1' then
@@ -2562,9 +2593,18 @@ begin
 						MATH_B := AddSub(unsigned(COLOR(14 downto 10) and COLOR_MASK), unsigned(PREV_COLOR(14 downto 10) and COLOR_MASK), '1', '1');
 					elsif (MATH_EN = '1' and SUB_EN = '1') or MATH_RESET(0) /= '0' then
 						if SUB_MATH_EN = '1' then
-							MATH_R := AddSub(unsigned(COLOR(4 downto 0) and COLOR_MASK), unsigned(PREV_COLOR(4 downto 0)), not CGADSUB(7), HALF);
-							MATH_G := AddSub(unsigned(COLOR(9 downto 5) and COLOR_MASK), unsigned(PREV_COLOR(9 downto 5)), not CGADSUB(7), HALF);
-							MATH_B := AddSub(unsigned(COLOR(14 downto 10) and COLOR_MASK), unsigned(PREV_COLOR(14 downto 10)), not CGADSUB(7), HALF );
+							-- HD Mode 7: Use CGRAM port B (sub-screen sprite color)
+							-- directly, since PREV_COLOR holds the other sub-pixel's
+							-- terrain color, not the sub-screen composite.
+							if M7_HD = '1' and BG_MODE_SYNC = "111" then
+								MATH_R := AddSub(unsigned(COLOR(4 downto 0) and COLOR_MASK), unsigned(CGRAM_Q_B(4 downto 0)), not CGADSUB(7), HALF);
+								MATH_G := AddSub(unsigned(COLOR(9 downto 5) and COLOR_MASK), unsigned(CGRAM_Q_B(9 downto 5)), not CGADSUB(7), HALF);
+								MATH_B := AddSub(unsigned(COLOR(14 downto 10) and COLOR_MASK), unsigned(CGRAM_Q_B(14 downto 10)), not CGADSUB(7), HALF);
+							else
+								MATH_R := AddSub(unsigned(COLOR(4 downto 0) and COLOR_MASK), unsigned(PREV_COLOR(4 downto 0)), not CGADSUB(7), HALF);
+								MATH_G := AddSub(unsigned(COLOR(9 downto 5) and COLOR_MASK), unsigned(PREV_COLOR(9 downto 5)), not CGADSUB(7), HALF);
+								MATH_B := AddSub(unsigned(COLOR(14 downto 10) and COLOR_MASK), unsigned(PREV_COLOR(14 downto 10)), not CGADSUB(7), HALF);
+							end if;
 						else
 							MATH_R := AddSub(unsigned(COLOR(4 downto 0) and COLOR_MASK), unsigned(SUBCOLBD(4 downto 0)), not CGADSUB(7), HALF);
 							MATH_G := AddSub(unsigned(COLOR(9 downto 5) and COLOR_MASK), unsigned(SUBCOLBD(9 downto 5)), not CGADSUB(7), HALF);
