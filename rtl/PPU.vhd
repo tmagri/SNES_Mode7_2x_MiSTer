@@ -305,6 +305,11 @@ signal CGRAM_ADDR_INC	: std_logic;
 
 signal CGRAM_ADDR_CLR	: unsigned(7 downto 0);
 
+-- CGRAM write contention fix: redirect writes through Port B during active rendering
+signal CGRAM_WR_CONTENTION : std_logic;
+signal CGRAM_B_DATA        : std_logic_vector(14 downto 0);
+signal CGRAM_B_WE          : std_logic;
+
 -- COLOR MATH
 signal MATH_RESET			: std_logic_vector(1 downto 0);
 signal PREV_COLOR			: std_logic_vector(14 downto 0);
@@ -377,19 +382,39 @@ port map(
 	q_a		 => CGRAM_Q,
 	
 	address_b => CGRAM_B_ADDR,
-	data_b	 => std_logic_vector(CGRAM_ADDR_CLR(6 downto 0)) & std_logic_vector(CGRAM_ADDR_CLR),
-	wren_b	 => not RST_N,
+	data_b	 => CGRAM_B_DATA,
+	wren_b	 => CGRAM_B_WE,
 	q_b		 => CGRAM_Q_B
 );
 
 CGRAM_ADDR_CLR <= CGRAM_ADDR_CLR + 1 when rising_edge(CLK);
 
+-- Detect CGRAM write contention: a write arrives while Port A is busy with rendering
+CGRAM_WR_CONTENTION <= '1' when BG_MATH = '1' and FORCE_BLANK = '0'
+                            and CGADD(0) = '1' and PAWR_N = '0'
+                            and PA = x"22" and SYSCLK_CE = '1'
+                       else '0';
+
 CGRAM_ADDR <= CGRAM_FETCH_ADDR when BG_MATH = '1' and FORCE_BLANK = '0' else 
 				  CGADD(8 downto 1);
-CGRAM_B_ADDR <= CGRAM_SUB_FETCH_ADDR when BG_MATH = '1' and FORCE_BLANK = '0' and RST_N = '1' else
+
+-- Port B address: contention write > sub-screen fetch > reset clear
+CGRAM_B_ADDR <= CGADD(8 downto 1) when CGRAM_WR_CONTENTION = '1' else
+				  CGRAM_SUB_FETCH_ADDR when BG_MATH = '1' and FORCE_BLANK = '0' and RST_N = '1' else
 				  std_logic_vector(CGRAM_ADDR_CLR);
+
+-- Port B data: contention write data or reset pattern
+CGRAM_B_DATA <= CGRAM_D when CGRAM_WR_CONTENTION = '1' else
+				  std_logic_vector(CGRAM_ADDR_CLR(6 downto 0)) & std_logic_vector(CGRAM_ADDR_CLR);
+
+-- Port B write enable: contention redirect or reset clear
+CGRAM_B_WE <= '1' when CGRAM_WR_CONTENTION = '1' else not RST_N;
+
 CGRAM_D <= DI(6 downto 0) & CGRAM_Lsb;
-CGRAM_WE <= '1' when CGADD(0) = '1' and PAWR_N = '0' and PA = x"22" and SYSCLK_CE = '1' else '0';
+
+-- Port A write: suppress during contention (write goes through Port B instead)
+CGRAM_WE <= '1' when CGADD(0) = '1' and PAWR_N = '0' and PA = x"22" and SYSCLK_CE = '1'
+                 and CGRAM_WR_CONTENTION = '0' else '0';
 
 process( RST_N, CLK )
 begin

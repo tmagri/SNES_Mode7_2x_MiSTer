@@ -9,7 +9,7 @@ It will not be pushed to `master` in its current form, since other pending chang
 
 Current status:
 * Mode 7 Wide-Res works. It doubles the resolution of Mode 7 backgrounds to 512×448 by rendering two horizontal sub-pixels per dot clock (dual-port VRAM) and two vertical sub-scanlines via field interlace (B/2, D/2 affine offset on alternate fields). Sprites and other layers remain at native resolution.
-* The PPU asserts INTERLACE when Wide-Res is active, so the MiSTer scaler automatically deinterlaces the 448i output. Enable the M7 WR Bob Deint. option in the OSD to use HDMI bob deinterlacing for the smoothest result on progressive displays.
+* The PPU asserts INTERLACE when Wide-Res is active, and HDMI bob deinterlacing is now auto-enabled for interlaced frames to improve progressive-display stability (reduce shimmer/combing by default).
 * Overclock fix for Top Gear 3000 works, albeit with minor visual glitches.
 
 For regular support, please use the main MiSTer community channels.
