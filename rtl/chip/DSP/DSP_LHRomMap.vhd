@@ -125,7 +125,7 @@ begin
 
 	DSP_CLK <= 900000 when (MAP_DSP_VER = "011" and GSU_TURBO = '1') else
 	           900000 when MAP_CTRL(3) = '1' else 
-	           800000 when MAP_DSP_VER = "011" else
+	           842000 when MAP_DSP_VER = "011" else
 			   760000;
 
 	process( CA, MAP_CTRL, CC_DR, ROMSEL_N, RAMSEL_N, BSRAM_MASK, ROM_MASK )
