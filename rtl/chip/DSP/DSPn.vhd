@@ -578,15 +578,6 @@ begin
 				RD_Nr <= RD_Nr(1 downto 0) & RD_N;
 				
 				if WR_Nr = "110" and CS_N = '0' and A0 = '0' then
-					if DRC = '0' then
-						if DRS = '0' then
-							DR(7 downto 0) <= DI;
-						else
-							DR(15 downto 8) <= DI;
-						end if;
-					else
-						DR(7 downto 0) <= DI;
-					end if;
 					PORT_ACTIVE <= '1';
 				elsif RD_Nr = "110" and CS_N = '0' and A0 = '0' then
 					PORT_ACTIVE <= '1';
@@ -612,6 +603,19 @@ begin
 						RQM <= '1';
 					end if;
 				end if;
+
+				if WR_N = '0' and CS_N = '0' and A0 = '0' then
+					if DRC = '0' then
+						if DRS = '0' then
+							DR(7 downto 0) <= DI;
+						else
+							DR(15 downto 8) <= DI;
+						end if;
+					else
+						DR(7 downto 0) <= DI;
+					end if;
+				end if;
+
 			end if;
 
 			if SS_BUSY = '1' and SS_REGS_SEL = '1' and WR_N = '0' then
