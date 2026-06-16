@@ -20,6 +20,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/ioport.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/lightgun.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/miracle.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/hps_ext.v
+set_global_assignment -name VERILOG_FILE rtl/hd_mode7_linebuf.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestates.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestates_regs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestates_map.sv

@@ -118,6 +118,24 @@ entity SNES is
 
 		M7_HD			: in std_logic;
 
+		-- Phase 1: Mode 7 register outputs (exposed to top level for HPS snooping)
+		M7A_OUT			: out std_logic_vector(15 downto 0);
+		M7B_OUT			: out std_logic_vector(15 downto 0);
+		M7C_OUT			: out std_logic_vector(15 downto 0);
+		M7D_OUT			: out std_logic_vector(15 downto 0);
+		M7X_OUT			: out std_logic_vector(12 downto 0);
+		M7Y_OUT			: out std_logic_vector(12 downto 0);
+		M7HOFS_OUT		: out std_logic_vector(12 downto 0);
+		M7VOFS_OUT		: out std_logic_vector(12 downto 0);
+
+		-- Phase 1: HD pixel mux inputs (ARM-generated HD Mode 7 scanline pixels)
+		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);
+		HD_MODE7_EN		: in std_logic;
+
+		-- Phase 2: PPU rendering signals for line buffer sync
+		X_OUT			: out std_logic_vector(8 downto 0);
+		FRAME_OUT		: out std_logic;
+
 		AUDIO_L		: out std_logic_vector(15 downto 0);
 		AUDIO_R		: out std_logic_vector(15 downto 0)
 	);
@@ -366,6 +384,24 @@ begin
 		BG_EN			=> DBG_BG_EN,
 
 		M7_HD			=> M7_HD,
+
+		-- Phase 1 Task 1.1: Mode 7 register outputs
+		M7A_OUT			=>	M7A_OUT,
+		M7B_OUT			=>	M7B_OUT,
+		M7C_OUT			=>	M7C_OUT,
+		M7D_OUT			=>	M7D_OUT,
+		M7X_OUT			=>	M7X_OUT,
+		M7Y_OUT			=>	M7Y_OUT,
+		M7HOFS_OUT		=>	M7HOFS_OUT,
+		M7VOFS_OUT		=>	M7VOFS_OUT,
+
+		-- Phase 1 Task 1.2: HD pixel mux inputs
+		HD_PIXEL_IN		=>	HD_PIXEL_IN,
+		HD_MODE7_EN		=>	HD_MODE7_EN,
+
+		-- Phase 2: PPU rendering signals for line buffer sync
+		X_OUT			=>	X_OUT,
+		FRAME_OUT		=>	FRAME_OUT,
 
 		SS_A		=> INT_CA(7 downto 0),
 		SS_DO		=> SS_PPU_DO

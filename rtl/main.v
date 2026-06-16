@@ -110,6 +110,24 @@ module main (
 	
 	input             DSP_FREQ,
 
+	// Phase 1: Mode 7 register outputs (for HPS/ARM snooping via hps_ext)
+	output     [15:0] M7A_OUT,
+	output     [15:0] M7B_OUT,
+	output     [15:0] M7C_OUT,
+	output     [15:0] M7D_OUT,
+	output     [12:0] M7X_OUT,
+	output     [12:0] M7Y_OUT,
+	output     [12:0] M7HOFS_OUT,
+	output     [12:0] M7VOFS_OUT,
+
+	// Phase 1: HD pixel mux inputs (ARM-generated HD Mode 7 scanline pixels)
+	input      [23:0] HD_PIXEL_IN,
+	input             HD_MODE7_EN,
+
+	// Phase 2: PPU rendering signals for line buffer sync
+	output      [8:0] X_OUT,
+	output            FRAME_OUT,
+
 	output     [15:0] MSU_TRACK_NUM,
 	output            MSU_TRACK_REQUEST,
 	input             MSU_TRACK_MOUNTING,
@@ -285,6 +303,24 @@ SNES SNES
 	.DBG_CPU_EN(DBG_CPU_EN),
 
 	.m7_hd(M7_HD),
+
+	// Phase 1: Mode 7 register outputs
+	.m7a_out(M7A_OUT),
+	.m7b_out(M7B_OUT),
+	.m7c_out(M7C_OUT),
+	.m7d_out(M7D_OUT),
+	.m7x_out(M7X_OUT),
+	.m7y_out(M7Y_OUT),
+	.m7hofs_out(M7HOFS_OUT),
+	.m7vofs_out(M7VOFS_OUT),
+
+	// Phase 1: HD pixel mux inputs (tied off; Phase 2 will drive these from the line buffer)
+	.hd_pixel_in(HD_PIXEL_IN),
+	.hd_mode7_en(HD_MODE7_EN),
+
+	// Phase 2: PPU rendering signals for line buffer sync
+	.x_out(X_OUT),
+	.frame_out(FRAME_OUT),
 
 	.turbo(TURBO),
 	

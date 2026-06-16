@@ -62,6 +62,20 @@ entity SPPU is
 
 		M7_HD			: in std_logic;
 
+		-- Phase 1 Task 1.1: Mode 7 register outputs (for HPS/ARM snooping)
+		M7A_OUT			: out std_logic_vector(15 downto 0);
+		M7B_OUT			: out std_logic_vector(15 downto 0);
+		M7C_OUT			: out std_logic_vector(15 downto 0);
+		M7D_OUT			: out std_logic_vector(15 downto 0);
+		M7X_OUT			: out std_logic_vector(12 downto 0);
+		M7Y_OUT			: out std_logic_vector(12 downto 0);
+		M7HOFS_OUT		: out std_logic_vector(12 downto 0);
+		M7VOFS_OUT		: out std_logic_vector(12 downto 0);
+
+		-- Phase 1 Task 1.2: HD pixel mux inputs (ARM-generated high-res scanline pixels)
+		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);	-- 24-bit RGB from ARM
+		HD_MODE7_EN		: in std_logic;						-- '1' = ARM pixels valid, override PPU
+
 		SS_A			: in std_logic_vector(7 downto 0);
 		SS_DO			: out std_logic_vector(7 downto 0)
 	);
@@ -2717,12 +2731,25 @@ begin
 	end if;
 end process;
 
-COLOR_OUT <= (others => '0') when BG_FORCE_BLANK = '1' else
-             BRIGHT_SUB_B  & BRIGHT_SUB_G  & BRIGHT_SUB_R when DOT_CLK = '1' else
+-- Phase 1 Task 1.2: HD Mode 7 video mux.
+-- Priority: force-blank -> ARM HD pixels (when enabled + Mode 7 active) -> standard PPU pixels.
+COLOR_OUT <= (others => '0')                when BG_FORCE_BLANK = '1'                                     else
+             HD_PIXEL_IN                    when HD_MODE7_EN = '1' and BG_MODE_SYNC = "111"               else
+             BRIGHT_SUB_B  & BRIGHT_SUB_G  & BRIGHT_SUB_R when DOT_CLK = '1'                             else
              BRIGHT_MAIN_B & BRIGHT_MAIN_G & BRIGHT_MAIN_R;
 DOTCLK <= DOT_CLK;
 HBLANK <= IN_HBL;
 VBLANK <= IN_VBL;
+
+-- Phase 1 Task 1.1: Route Mode 7 registers to output ports for HPS snooping.
+M7A_OUT    <= M7A;
+M7B_OUT    <= M7B;
+M7C_OUT    <= M7C;
+M7D_OUT    <= M7D;
+M7X_OUT    <= M7X;
+M7Y_OUT    <= M7Y;
+M7HOFS_OUT <= M7HOFS;
+M7VOFS_OUT <= M7VOFS;
 
 HIGH_RES <= HIRES or (PSEUDOHIRES and not BLEND)
 				or (M7_HD and not HIRES and not PSEUDOHIRES

@@ -329,7 +329,7 @@ parameter CONF_STR = {
 	"P1oA,Force 256px,Off,On;",
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
-	"P1O[58],Mode 7 Wide-Res,Off,On;",
+	"P1O[58],True HD Mode 7,Off,On;",
 	"P1-;",
 	"P1OJK,Stereo Mix,None,25%,50%,100%;", 
 
@@ -607,6 +607,34 @@ wire [ 7:0] ss_ddr_be;
 reg [15:0] main_audio_l;
 reg [15:0] main_audio_r;
 
+// Phase 1: Mode 7 register wires (outputs from main, available for hps_ext in Phase 2)
+wire [15:0] m7a_out, m7b_out, m7c_out, m7d_out;
+wire [12:0] m7x_out, m7y_out, m7hofs_out, m7vofs_out;
+
+// Phase 2 Task 2.1: HD Mode 7 Line Buffer wires
+wire [8:0]  x_out;
+wire        frame_out;
+wire [23:0] hd_pixel_in;
+wire        hd_mode7_en;
+
+wire [8:0]  buf_wr_addr;
+wire [23:0] buf_wr_data;
+wire        buf_wr_en;
+wire        buf_arm;
+
+hd_mode7_linebuf linebuf (
+    .clk(clk_sys),
+    .buf_wr_addr(buf_wr_addr),
+    .buf_wr_data(buf_wr_data),
+    .buf_wr_en(buf_wr_en),
+    .buf_arm(buf_arm),
+    .x_out(x_out),
+    .frame_out(frame_out),
+    .hblank(HBlank_out),
+    .hd_pixel_in(hd_pixel_in),
+    .hd_mode7_en(hd_mode7_en)
+);
+
 main main
 (
 	.RESET_N(RESET_N),
@@ -725,6 +753,24 @@ main main
 `endif
 
 	.M7_HD(M7_HD),
+
+	// Phase 1: Mode 7 register outputs (captured here; wired to hps_ext in Phase 2)
+	.M7A_OUT(m7a_out),
+	.M7B_OUT(m7b_out),
+	.M7C_OUT(m7c_out),
+	.M7D_OUT(m7d_out),
+	.M7X_OUT(m7x_out),
+	.M7Y_OUT(m7y_out),
+	.M7HOFS_OUT(m7hofs_out),
+	.M7VOFS_OUT(m7vofs_out),
+
+	// Phase 1: HD pixel mux inputs
+	.HD_PIXEL_IN(hd_pixel_in),
+	.HD_MODE7_EN(hd_mode7_en),
+
+	// Phase 2: PPU rendering signals for line buffer sync
+	.X_OUT(x_out),
+	.FRAME_OUT(frame_out),
 
 	// MSU register handling
 	.MSU_TRACK_NUM(msu_track_num),
@@ -1444,7 +1490,23 @@ hps_ext hps_ext
 	.msu_audio_sector(msu_audio_sector),
 	.msu_audio_download(msu_audio_download),
 
-	.msu_data_base(msu_data_base)
+	.msu_data_base(msu_data_base),
+
+	// Phase 2 Task 2.2: Mode 7 register inputs from SNES core
+	.m7a_in(m7a_out),
+	.m7b_in(m7b_out),
+	.m7c_in(m7c_out),
+	.m7d_in(m7d_out),
+	.m7x_in(m7x_out),
+	.m7y_in(m7y_out),
+	.m7hofs_in(m7hofs_out),
+	.m7vofs_in(m7vofs_out),
+
+	// Phase 2 Task 2.2: Line buffer write outputs
+	.buf_wr_addr(buf_wr_addr),
+	.buf_wr_data(buf_wr_data),
+	.buf_wr_en(buf_wr_en),
+	.buf_arm(buf_arm)
 );
 
 wire        msu_track_mounting;
