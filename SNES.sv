@@ -27,6 +27,11 @@ module emu
 	//Can be used as initial reset.
 	input         RESET,
 
+	// Dynamic HD Canvas Overlay signals to share with sys_top
+	output [3:0]  M7_SCALE,
+    output        HD_MODE7_EN,
+    output [23:0] HD_PIXEL_IN,
+
 	//Must be passed to hps_io module
 	inout  [48:0] HPS_BUS,
 
@@ -621,6 +626,11 @@ wire [8:0]  buf_wr_addr;
 wire [23:0] buf_wr_data;
 wire        buf_wr_en;
 wire        buf_arm;
+
+wire [3:0]  m7_scale_wire;
+assign M7_SCALE    = m7_scale_wire;
+assign HD_MODE7_EN = hd_mode7_en;
+assign HD_PIXEL_IN = hd_pixel_in;
 
 hd_mode7_linebuf linebuf (
     .clk(clk_sys),
@@ -1506,7 +1516,8 @@ hps_ext hps_ext
 	.buf_wr_addr(buf_wr_addr),
 	.buf_wr_data(buf_wr_data),
 	.buf_wr_en(buf_wr_en),
-	.buf_arm(buf_arm)
+	.buf_arm(buf_arm),
+	.m7_scale(m7_scale_wire)
 );
 
 wire        msu_track_mounting;

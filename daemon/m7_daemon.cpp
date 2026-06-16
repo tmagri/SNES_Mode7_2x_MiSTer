@@ -1,20 +1,19 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
 // ===========================================================================
-// Phase 3: True HD Mode 7 ARM C++ Daemon
+// Phase 3: True HD Mode 7 ARM C++ Daemon (Auto-Resolution Version)
 //
 // This daemon memory-maps the HPS-to-FPGA Lightweight bridge to communicate
-// with the sys_top ioctl / hps_ext mechanism.
-//
-// *Note*: In a full MiSTer environment, this logic is often integrated directly
-// into Main_MiSTer's user_io.cpp to share the SPI command lock. For this
-// standalone daemon, we assume exclusive access to the hps_ext bridge.
+// with the sys_top ioctl / hps_ext mechanism. It auto-detects the MiSTer
+// resolution from MiSTer.ini to set the optimal integer scale.
 // ===========================================================================
 
 #define HW_REGS_BASE (0xFF200000)
@@ -24,16 +23,14 @@
 // Hypothetical offset for the user_io / hps_ext command register on the bridge
 #define HPS_EXT_BASE_OFFSET 0x00000
 
-// hps_ext commands from Phase 2
+// hps_ext commands
 #define CMD_M7_READ 0x36
 #define CMD_M7_WRITE_PIXELS 0x37
+#define CMD_M7_SET_SCALE 0x38
 
-// SNES screen dimensions
+// SNES native screen dimensions
 #define SNES_WIDTH 256
 #define SNES_HEIGHT 224
-
-// HD Mode 7 multipliers (2x width for 512px line buffer)
-#define HD_WIDTH (SNES_WIDTH * 2)
 
 struct M7Regs {
   int16_t a, b, c, d;
@@ -47,9 +44,63 @@ private:
   void *virtual_base;
   volatile uint16_t *hps_ext_ptr;
 
-  // VRAM copy (requires separate integration to sync with FPGA WRAM/VRAM
-  // snooping)
+  // Dynamic resolution variables
+  int scale_multiplier;
+  int hd_width;
+
   std::vector<uint8_t> snes_vram;
+
+  // Parses MiSTer.ini to figure out the target resolution height
+  int determine_snes_multiplier() {
+    std::ifstream ini_file("/media/fat/MiSTer.ini");
+    int target_height = 1080; // Default to 1080p if file cannot be read
+
+    if (ini_file.is_open()) {
+      std::string line;
+      while (std::getline(ini_file, line)) {
+        // Ignore comments
+        if (line.empty() || line[0] == ';' || line[0] == '#')
+          continue;
+
+        // Look for video_mode (A robust implementation would also check [SNES]
+        // section overrides)
+        if (line.find("video_mode") == 0) {
+          // MiSTer standard modes (e.g., 0=720p, 8=1080p, 12=1440p) or custom
+          // strings (1920,1080,60)
+          if (line.find("1440") != std::string::npos ||
+              line.find("=12") != std::string::npos ||
+              line.find("= 12") != std::string::npos) {
+            target_height = 1440;
+          } else if (line.find("1080") != std::string::npos ||
+                     line.find("=8") != std::string::npos ||
+                     line.find("= 8") != std::string::npos) {
+            target_height = 1080;
+          } else if (line.find("720") != std::string::npos ||
+                     line.find("=0") != std::string::npos ||
+                     line.find("= 0") != std::string::npos) {
+            target_height = 720;
+          } else if (line.find("480") != std::string::npos) {
+            target_height = 480;
+          }
+        }
+      }
+      ini_file.close();
+    }
+
+    std::cout << "Detected Target Height: " << target_height << "p"
+              << std::endl;
+
+    // Calculate max integer scale that fits inside the target height
+    if (target_height >= 1344)
+      return 6; // 6x (1536x1344)
+    if (target_height >= 896)
+      return 4; // 4x (1024x896) - Best for 1080p
+    if (target_height >= 672)
+      return 3; // 3x (768x672) - Best for 720p
+    if (target_height >= 448)
+      return 2; // 2x (512x448)
+    return 1;   // 1x Native
+  }
 
 public:
   M7Daemon() {
@@ -70,6 +121,17 @@ public:
     hps_ext_ptr =
         (volatile uint16_t *)((uint8_t *)virtual_base + HPS_EXT_BASE_OFFSET);
     snes_vram.resize(64 * 1024, 0); // 64KB SNES VRAM placeholder
+
+    // Calculate scale on boot
+    scale_multiplier = determine_snes_multiplier();
+    hd_width = SNES_WIDTH * scale_multiplier;
+
+    std::cout << "Setting M7 Multiplier to: " << scale_multiplier
+              << "x (Width: " << hd_width << ")" << std::endl;
+
+    // Send the scale configuration to the FPGA
+    *hps_ext_ptr = CMD_M7_SET_SCALE;
+    *hps_ext_ptr = scale_multiplier;
   }
 
   ~M7Daemon() {
@@ -79,14 +141,10 @@ public:
     close(mem_fd);
   }
 
-  // Task 3.1: Read Matrix A, B, C, D and X, Y, HOFS, VOFS
   M7Regs read_m7_registers() {
     M7Regs regs;
-
-    // Write CMD_M7_READ to initiate the read sequence
     *hps_ext_ptr = CMD_M7_READ;
 
-    // Read the 8 consecutive 16-bit words returned by hps_ext.v
     regs.a = *hps_ext_ptr;
     regs.b = *hps_ext_ptr;
     regs.c = *hps_ext_ptr;
@@ -96,7 +154,6 @@ public:
     regs.hofs = *hps_ext_ptr & 0x1FFF;
     regs.vofs = *hps_ext_ptr & 0x1FFF;
 
-    // Sign extend 13-bit registers to 16-bit
     if (regs.x & 0x1000)
       regs.x |= 0xE000;
     if (regs.y & 0x1000)
@@ -109,49 +166,34 @@ public:
     return regs;
   }
 
-  // Task 3.3: Burst-write the generated pixel array to the FPGA
   void write_m7_pixels(const std::vector<uint16_t> &hd_pixels) {
     *hps_ext_ptr = CMD_M7_WRITE_PIXELS;
 
-    // Burst the 512 RGB565 pixels. The hps_ext.v state machine expects exactly
-    // 512 words and then asserts buf_arm to enable the line buffer for the
-    // upcoming scanline.
-    for (int i = 0; i < HD_WIDTH; ++i) {
+    // Burst the exact number of dynamically scaled pixels
+    for (int i = 0; i < hd_width; ++i) {
       *hps_ext_ptr = hd_pixels[i];
     }
   }
 
-  // Task 3.2: HD Mode 7 Rendering Routine
   std::vector<uint16_t> render_hd_scanline(const M7Regs &regs, int scanline) {
-    std::vector<uint16_t> pixels(HD_WIDTH, 0);
+    // Allocate vector sized to our dynamic HD width
+    std::vector<uint16_t> pixels(hd_width, 0);
 
-    // Standard Mode 7 math, calculated at 2x horizontal resolution
-    // (x_screen goes 0..511).
-
-    // Vertical coordinate in standard SNES space (0..223)
     int y_screen = scanline;
-
-    // Adjusted for center and scroll
     int cy = y_screen + regs.vofs - regs.y;
 
-    for (int x_screen = 0; x_screen < HD_WIDTH; ++x_screen) {
-      // Map 0..511 to 0..255 space (0.5 pixel steps)
-      // By multiplying x_screen by 128 instead of 256, we step by 0.5
-      int cx = (x_screen / 2) + regs.hofs - regs.x;
+    for (int x_screen = 0; x_screen < hd_width; ++x_screen) {
+      // Map the high-res screen X coordinate back to native 0..255 space
+      // E.g. if multiplier is 4x, every 4 pixels map to 1 native unit
+      int cx = (x_screen / scale_multiplier) + regs.hofs - regs.x;
 
-      // Apply the transformation matrix (fixed point 8.8)
       int map_x = ((regs.a * cx) + (regs.b * cy)) >> 8;
       int map_y = ((regs.c * cx) + (regs.d * cy)) >> 8;
 
       map_x += regs.x;
       map_y += regs.y;
 
-      // Fetch pixel from VRAM (Placeholder mapping)
-      // A real implementation needs access to the SNES tilemap/character data
-      // and the CGRAM (palette).
-      uint8_t color_index = 0;
-
-      // To prevent crashes in this mock, we just generate a test pattern
+      // Placeholder map rendering pattern
       uint16_t rgb565 = ((map_x & 0x1F) << 11) | ((map_y & 0x3F) << 5);
       pixels[x_screen] = rgb565;
     }
@@ -159,29 +201,15 @@ public:
     return pixels;
   }
 
-  // Main sync loop
   void run() {
-    std::cout << "Starting HD Mode 7 Daemon..." << std::cout;
+    std::cout << "Starting HD Mode 7 Daemon Main Loop..." << std::endl;
 
     while (true) {
-      // 1. Wait for VBLANK or HBLANK (Requires reading an interrupt or polled
-      // register) Placeholder: Usleep to simulate scanline timing (64us per
-      // line)
-      usleep(64);
-
-      // For the sake of the algorithm, we process scanlines 0..223
+      usleep(64); // Simulate scanline timing
       for (int scanline = 0; scanline < SNES_HEIGHT; ++scanline) {
-
-        // 2. Poll Mode 7 registers for this frame/scanline
         M7Regs regs = read_m7_registers();
-
-        // 3. Render the HD scanline
         std::vector<uint16_t> hd_pixels = render_hd_scanline(regs, scanline);
-
-        // 4. Burst write to FPGA Line Buffer
         write_m7_pixels(hd_pixels);
-
-        // Wait for next HBLANK
         usleep(64);
       }
     }

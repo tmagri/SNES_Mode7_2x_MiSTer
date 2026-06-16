@@ -51,10 +51,12 @@ module hps_ext
 	input      [12:0] m7vofs_in,
 
 	// Phase 2 Task 2.1: Line buffer write outputs
-	output reg [8:0]  buf_wr_addr,
+	output reg [10:0] buf_wr_addr,   // Updated to 11-bit for up to 2047 pixels
 	output reg [23:0] buf_wr_data,
 	output reg        buf_wr_en,
-	output reg        buf_arm
+	output reg        buf_arm,
+
+	output reg [3:0]  m7_scale
 );
 
 assign EXT_BUS[15:0] = io_dout;
@@ -64,16 +66,17 @@ wire io_strobe = EXT_BUS[33];
 wire io_enable = EXT_BUS[34];
 
 localparam EXT_CMD_MIN = CD_GET;
-localparam EXT_CMD_MAX = CMD_M7_WRITE_PIXELS;
+localparam EXT_CMD_MAX = CMD_M7_SET_SCALE;
 
 localparam CD_GET = 'h34;
 localparam CD_SET = 'h35;
 localparam CMD_M7_READ         = 'h36;
 localparam CMD_M7_WRITE_PIXELS = 'h37;
+localparam CMD_M7_SET_SCALE    = 'h38;
 
 reg [15:0] io_dout;
 reg        dout_en = 0;
-reg  [9:0] byte_cnt;
+reg  [10:0] byte_cnt;
 
 always@(posedge clk_sys) begin
 	reg [15:0] cmd;
@@ -138,12 +141,17 @@ always@(posedge clk_sys) begin
 				CMD_M7_WRITE_PIXELS:
 					begin
 						// ARM writes 16-bit RGB565 per pixel. Convert to 24-bit RGB888.
-						buf_wr_addr <= byte_cnt[8:0] - 9'd1;
+						buf_wr_addr <= byte_cnt[10:0] - 11'd1;
 						buf_wr_data <= {io_din[15:11], io_din[15:13], io_din[10:5], io_din[10:9], io_din[4:0], io_din[4:2]};
 						buf_wr_en   <= 1;
-						
-						// If ARM has written all 512 pixels, arm the line buffer.
-						if (byte_cnt == 512) buf_arm <= 1;
+
+						// If ARM has written all pixels, arm the line buffer.
+						if (byte_cnt == 256 * m7_scale) buf_arm <= 1; 
+					end
+				
+				CMD_M7_SET_SCALE:
+					if(byte_cnt == 1) begin
+						m7_scale <= io_din[3:0];
 					end
 			endcase
 		end

@@ -24,32 +24,28 @@
 //  ARM must re-write and re-arm every line during HBLANK.
 //
 // ===========================================================================
-
 module hd_mode7_linebuf
 (
     input             clk,            // Single clock domain (clk_sys)
 
     // --- Port A: ARM write interface ---
-    input      [8:0]  buf_wr_addr,    // Pixel index 0..511
-    input      [23:0] buf_wr_data,    // RGB 8:8:8 pixel from ARM
-    input             buf_wr_en,      // Write strobe (active high)
-    input             buf_arm,        // Arm this scanline (set after last write)
+    input      [10:0] buf_wr_addr,    // UPDATED: 11-bit for up to 2047 pixels
+    input      [23:0] buf_wr_data,    
+    input             buf_wr_en,      
+    input             buf_arm,        
 
     // --- Port B: Video read interface ---
-    input      [8:0]  x_out,          // Current horizontal pixel position from PPU
+    input      [10:0] hd_x_out,       // NEW: High-Res horizontal pixel position (0 to 2047)
     input             frame_out,      // Pulse at start of each new pixel row (from PPU)
     input             hblank,         // PPU HBLANK signal
 
     // --- Outputs to PPU mux ---
-    output reg [23:0] hd_pixel_in,    // HD pixel data (to HD_PIXEL_IN port)
-    output reg        hd_mode7_en     // Enable: override standard PPU output
+    output reg [23:0] hd_pixel_in,    
+    output reg        hd_mode7_en     
 );
 
-// ---------------------------------------------------------------------------
-// Internal line buffer: 512 entries × 24-bit RGB
-// Inferred dual-port Block RAM (Altera Cyclone V synthesis)
-// ---------------------------------------------------------------------------
-reg [23:0] linebuf [0:511];
+// UPDATED: Internal line buffer expanded to 2048 entries × 24-bit RGB
+reg [23:0] linebuf [0:2047];
 
 // Port A: synchronous write
 always @(posedge clk) begin
@@ -57,32 +53,22 @@ always @(posedge clk) begin
         linebuf[buf_wr_addr] <= buf_wr_data;
 end
 
-// Port B: synchronous read
+// Port B: synchronous read (using HD coordinate)
 reg [23:0] rd_data;
 always @(posedge clk) begin
-    rd_data <= linebuf[x_out];
+    rd_data <= linebuf[hd_x_out];
 end
 
-// ---------------------------------------------------------------------------
 // ARM-triggered "armed" flag
-//   · Set   : when buf_arm is pulsed (ARM finished writing the scanline)
-//   · Clear : at the rising edge of frame_out (start of a new active line)
-// ---------------------------------------------------------------------------
 reg armed = 1'b0;
-
 always @(posedge clk) begin
     if (frame_out)
-        armed <= 1'b0;      // New line started – clear until ARM re-arms
+        armed <= 1'b0;
     else if (buf_arm)
-        armed <= 1'b1;      // ARM signals scanline data is ready
+        armed <= 1'b1;
 end
 
-// ---------------------------------------------------------------------------
 // Output pipeline
-//   · hd_mode7_en is active only when armed AND inside the active region
-//     (not during HBLANK).
-//   · One extra register stage to keep timing clean (matches dpram latency).
-// ---------------------------------------------------------------------------
 always @(posedge clk) begin
     hd_pixel_in  <= rd_data;
     hd_mode7_en  <= armed & ~hblank;
