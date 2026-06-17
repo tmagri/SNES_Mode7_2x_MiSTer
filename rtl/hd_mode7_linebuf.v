@@ -11,9 +11,9 @@
 //    · Enable  = buf_wr_en
 //
 //  Port B  (read, video clock = same clk_sys in this design)
-//    · Addressed by the PPU's horizontal pixel position (x_out[8:0]).
+//    · Addressed by the PPU's horizontal pixel position (hd_x_out[10:0]).
 //    · Output drives HD_PIXEL_IN into the PPU video mux.
-//    · HD_MODE7_EN is asserted whenever x_out is inside the active region and
+//    · HD_MODE7_EN is asserted whenever hd_x_out is inside the active region and
 //      the buffer has been primed (armed) by the ARM for this line.
 //
 //  Arming / Line Sync
@@ -26,50 +26,50 @@
 // ===========================================================================
 module hd_mode7_linebuf
 (
-    input             clk,            // Single clock domain (clk_sys)
+    input             clk_sys,        // NEW: ARM Write Domain
+    input             clk_vid,        // NEW: Video Read Domain
 
     // --- Port A: ARM write interface ---
-    input      [10:0] buf_wr_addr,    // UPDATED: 11-bit for up to 2047 pixels
+    input      [10:0] buf_wr_addr,
     input      [23:0] buf_wr_data,    
     input             buf_wr_en,      
     input             buf_arm,        
 
     // --- Port B: Video read interface ---
-    input      [10:0] hd_x_out,       // NEW: High-Res horizontal pixel position (0 to 2047)
-    input             frame_out,      // Pulse at start of each new pixel row (from PPU)
-    input             hblank,         // PPU HBLANK signal
+    input      [10:0] hd_x_out,       // Fixed port name!
+    input             frame_out,      
+    input             hblank,         
 
     // --- Outputs to PPU mux ---
     output reg [23:0] hd_pixel_in,    
     output reg        hd_mode7_en     
 );
 
-// UPDATED: Internal line buffer expanded to 2048 entries × 24-bit RGB
 reg [23:0] linebuf [0:2047];
 
-// Port A: synchronous write
-always @(posedge clk) begin
+// Port A: synchronous write (ARM Domain)
+always @(posedge clk_sys) begin
     if (buf_wr_en)
         linebuf[buf_wr_addr] <= buf_wr_data;
 end
 
-// Port B: synchronous read (using HD coordinate)
+// Port B: synchronous read (Video Domain)
 reg [23:0] rd_data;
-always @(posedge clk) begin
+always @(posedge clk_vid) begin
     rd_data <= linebuf[hd_x_out];
 end
 
-// ARM-triggered "armed" flag
+// ARM-triggered "armed" flag (Tracked on Sys Domain to safely catch ARM signals)
 reg armed = 1'b0;
-always @(posedge clk) begin
+always @(posedge clk_sys) begin
     if (frame_out)
         armed <= 1'b0;
     else if (buf_arm)
         armed <= 1'b1;
 end
 
-// Output pipeline
-always @(posedge clk) begin
+// Output pipeline (Video Domain)
+always @(posedge clk_vid) begin
     hd_pixel_in  <= rd_data;
     hd_mode7_en  <= armed & ~hblank;
 end

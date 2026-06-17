@@ -1802,6 +1802,7 @@ emu emu
 	.M7_SCALE(m7_scale),
     .HD_MODE7_EN(hd_mode7_en),
     .HD_PIXEL_IN(hd_pixel_in),
+	.HD_X_COORD(hd_x_coord),
 	.HPS_BUS({fb_en, sl, f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,
 				 ce_hpix, hde_emu, hhs_fix, hvs_fix, 

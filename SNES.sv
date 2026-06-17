@@ -31,6 +31,7 @@ module emu
 	output [3:0]  M7_SCALE,
     output        HD_MODE7_EN,
     output [23:0] HD_PIXEL_IN,
+	input  [10:0] HD_X_COORD,
 
 	//Must be passed to hps_io module
 	inout  [48:0] HPS_BUS,
@@ -633,12 +634,13 @@ assign HD_MODE7_EN = hd_mode7_en;
 assign HD_PIXEL_IN = hd_pixel_in;
 
 hd_mode7_linebuf linebuf (
-    .clk(clk_sys),
+    .clk_sys(clk_sys),
+    .clk_vid(CLK_VIDEO),
     .buf_wr_addr(buf_wr_addr),
     .buf_wr_data(buf_wr_data),
     .buf_wr_en(buf_wr_en),
     .buf_arm(buf_arm),
-    .x_out(x_out),
+	.hd_x_out(HD_X_COORD),
     .frame_out(frame_out),
     .hblank(HBlank_out),
     .hd_pixel_in(hd_pixel_in),
