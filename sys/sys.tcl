@@ -218,3 +218,10 @@ set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
 set_global_assignment -name CDF_FILE jtag.cdf
 set_global_assignment -name QIP_FILE sys/sys.qip
 
+# ====================================================================
+# NOTE: The Phase 4 PIO/Avalon bridge to the HPS lightweight AXI master
+# (add_instance m7_hd_bus altera_avalon_pio, etc.) was removed — those are
+# Platform Designer (Qsys) commands and not valid in this Quartus-main Tcl
+# context. The daemon now reads M7 registers via the DDR3 mailbox in
+# SNES.sv instead of the AXI bridge, so the PIO is obsolete.
+# ====================================================================

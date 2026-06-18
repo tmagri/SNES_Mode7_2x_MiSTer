@@ -137,7 +137,11 @@ entity SNES is
 		FRAME_OUT		: out std_logic;
 
 		AUDIO_L		: out std_logic_vector(15 downto 0);
-		AUDIO_R		: out std_logic_vector(15 downto 0)
+		AUDIO_R		: out std_logic_vector(15 downto 0);
+
+		-- Add these to pass the electron gun coordinates up to Verilog
+		HCount_out : out std_logic_vector(8 downto 0);
+		VCount_out : out std_logic_vector(8 downto 0)
 	);
 end SNES;
 
@@ -402,6 +406,10 @@ begin
 		-- Phase 2: PPU rendering signals for line buffer sync
 		X_OUT			=>	X_OUT,
 		FRAME_OUT		=>	FRAME_OUT,
+
+		-- Phase 1 Task 1.3: raw electron-gun counters for DMA sync
+		HCOUNT_OUT		=>	HCount_out,
+		VCOUNT_OUT		=>	VCount_out,
 
 		SS_A		=> INT_CA(7 downto 0),
 		SS_DO		=> SS_PPU_DO

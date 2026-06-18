@@ -128,6 +128,10 @@ module main (
 	output      [8:0] X_OUT,
 	output            FRAME_OUT,
 
+	// Phase 1 Task 1.3: raw electron-gun counters for HD Mode 7 DMA sync
+	output      [8:0] HCOUNT_OUT,
+	output      [8:0] VCOUNT_OUT,
+
 	output     [15:0] MSU_TRACK_NUM,
 	output            MSU_TRACK_REQUEST,
 	input             MSU_TRACK_MOUNTING,
@@ -321,6 +325,10 @@ SNES SNES
 	// Phase 2: PPU rendering signals for line buffer sync
 	.x_out(X_OUT),
 	.frame_out(FRAME_OUT),
+
+	// Phase 1 Task 1.3: raw electron-gun counters for HD Mode 7 DMA sync
+	.hcount_out(HCOUNT_OUT),
+	.vcount_out(VCOUNT_OUT),
 
 	.turbo(TURBO),
 	

@@ -50,6 +50,13 @@ entity SPPU is
 		FRAME_OUT	: out std_logic;
 		V224			: out std_logic;
 		
+		-- Phase 1 Task 1.3: Raw electron-gun counters for HD Mode 7 DMA sync.
+		-- These are the raw H_CNT/V_CNT values (0..339 / 0..262 NTSC) BEFORE
+		-- any MATH/OUT pipeline delay, so the DMA reader can fetch pixels one
+		-- scanline ahead of the video output mux.
+		HCOUNT_OUT	: out std_logic_vector(8 downto 0);
+		VCOUNT_OUT	: out std_logic_vector(8 downto 0);
+		
 		FIELD_OUT	: out std_logic;
 		INTERLACE	: out std_logic;
 		
@@ -2740,6 +2747,10 @@ COLOR_OUT <= (others => '0')                when BG_FORCE_BLANK = '1'           
 DOTCLK <= DOT_CLK;
 HBLANK <= IN_HBL;
 VBLANK <= IN_VBL;
+
+-- Phase 1 Task 1.3: Raw electron-gun counters for HD Mode 7 DMA sync.
+HCOUNT_OUT <= std_logic_vector(H_CNT);
+VCOUNT_OUT <= std_logic_vector(V_CNT);
 
 -- Phase 1 Task 1.1: Route Mode 7 registers to output ports for HPS snooping.
 M7A_OUT    <= M7A;

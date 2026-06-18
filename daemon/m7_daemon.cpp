@@ -9,24 +9,17 @@
 #include <vector>
 
 // ===========================================================================
-// Phase 3: True HD Mode 7 ARM C++ Daemon (Auto-Resolution Version)
+// Phase 3: True HD Mode 7 ARM C++ Daemon (DDR3 Shared Memory Version)
 //
-// This daemon memory-maps the HPS-to-FPGA Lightweight bridge to communicate
-// with the sys_top ioctl / hps_ext mechanism. It auto-detects the MiSTer
-// resolution from MiSTer.ini to set the optimal integer scale.
+// This daemon allocates a 16MB chunk of physical DDR3 RAM. It writes the
+// rendered HD pixels directly to memory, where the FPGA's sysmem controller
+// will fetch them, eliminating AXI bridge collisions entirely.
 // ===========================================================================
 
-#define HW_REGS_BASE (0xFF200000)
-#define HW_REGS_SPAN (0x00200000)
-#define HW_REGS_MASK (HW_REGS_SPAN - 1)
-
-// Hypothetical offset for the user_io / hps_ext command register on the bridge
-#define HPS_EXT_BASE_OFFSET 0x00000
-
-// hps_ext commands
-#define CMD_M7_READ 0x36
-#define CMD_M7_WRITE_PIXELS 0x37
-#define CMD_M7_SET_SCALE 0x38
+// 0x3E000000 is safely placed in the upper half of the MiSTer's 1GB DDR3 RAM,
+// far away from the Linux OS which sits in the lower half.
+#define DDR3_PHYS_BASE 0x3E000000
+#define DDR3_SPAN 0x01000000 // 16 MB of space (plenty for HD frames)
 
 // SNES native screen dimensions
 #define SNES_WIDTH 256
@@ -42,13 +35,12 @@ class M7Daemon {
 private:
   int mem_fd;
   void *virtual_base;
-  volatile uint16_t *hps_ext_ptr;
+  uint32_t *hd_pixel_buffer; // Pointer to our massive RAM canvas
+  volatile uint16_t *mailbox_regs; // Phase 4: 8 × 16-bit M7 regs written by FPGA
 
   // Dynamic resolution variables
   int scale_multiplier;
   int hd_width;
-
-  std::vector<uint8_t> snes_vram;
 
   // Parses MiSTer.ini to figure out the target resolution height
   int determine_snes_multiplier() {
@@ -62,11 +54,7 @@ private:
         if (line.empty() || line[0] == ';' || line[0] == '#')
           continue;
 
-        // Look for video_mode (A robust implementation would also check [SNES]
-        // section overrides)
         if (line.find("video_mode") == 0) {
-          // MiSTer standard modes (e.g., 0=720p, 8=1080p, 12=1440p) or custom
-          // strings (1920,1080,60)
           if (line.find("1440") != std::string::npos ||
               line.find("=12") != std::string::npos ||
               line.find("= 12") != std::string::npos) {
@@ -90,7 +78,6 @@ private:
     std::cout << "Detected Target Height: " << target_height << "p"
               << std::endl;
 
-    // Calculate max integer scale that fits inside the target height
     if (target_height >= 1344)
       return 6; // 6x (1536x1344)
     if (target_height >= 896)
@@ -110,81 +97,96 @@ public:
       exit(1);
     }
 
-    virtual_base = mmap(NULL, HW_REGS_SPAN, (PROT_READ | PROT_WRITE),
-                        MAP_SHARED, mem_fd, HW_REGS_BASE);
+    // Map the physical DDR3 RAM directly into our C++ virtual space
+    virtual_base = mmap(NULL, DDR3_SPAN, (PROT_READ | PROT_WRITE), MAP_SHARED,
+                        mem_fd, DDR3_PHYS_BASE);
+
     if (virtual_base == MAP_FAILED) {
       std::cerr << "ERROR: mmap failed" << std::endl;
       close(mem_fd);
       exit(1);
     }
 
-    hps_ext_ptr =
-        (volatile uint16_t *)((uint8_t *)virtual_base + HPS_EXT_BASE_OFFSET);
-    snes_vram.resize(64 * 1024, 0); // 64KB SNES VRAM placeholder
+    // Cast the raw memory block to a 32-bit integer array so we can write
+    // pixels to it. Skip the first 4 KB — that page is reserved for the
+    // FPGA's register mailbox (8 × 16-bit Mode 7 regs written by the FPGA
+    // at the start of every frame). Pixels live at offset 0x1000.
+    hd_pixel_buffer = (uint32_t *)((uint8_t *)virtual_base + 0x1000);
+    mailbox_regs    = (volatile uint16_t *)virtual_base;
 
     // Calculate scale on boot
     scale_multiplier = determine_snes_multiplier();
     hd_width = SNES_WIDTH * scale_multiplier;
 
+    // TODO(Phase 5): push scale_multiplier to the FPGA via CMD_M7_SET_SCALE
+    // so the DMA reader's HD_WIDTH matches our local hd_width. The MiSTer
+    // framework's hps_ext protocol requires linking against libuserio and
+    // calling:
+    //     spi_uio_cmd_cont(0x38);  // CMD_M7_SET_SCALE
+    //     spi_w(scale_multiplier);
+    //     DisableIO();
+    // (Reference: support/megacd/megacd.cpp in Main_MiSTer.) Without that,
+    // the FPGA defaults to 4x (see hps_ext.v) and the daemon MUST also use
+    // 4x — override the ini-derived value here for now.
+    if (scale_multiplier != 4) {
+        std::cerr << "WARNING: dynamic scale (" << scale_multiplier
+                  << "x) is not wired to the FPGA yet; forcing 4x to match "
+                  << "the FPGA default. See Phase 5 TODO." << std::endl;
+        scale_multiplier = 4;
+        hd_width = SNES_WIDTH * scale_multiplier;
+    }
+
     std::cout << "Setting M7 Multiplier to: " << scale_multiplier
               << "x (Width: " << hd_width << ")" << std::endl;
-
-    // Send the scale configuration to the FPGA
-    *hps_ext_ptr = CMD_M7_SET_SCALE;
-    *hps_ext_ptr = scale_multiplier;
   }
 
+  // Safely unmap the memory block on close
   ~M7Daemon() {
     if (virtual_base != MAP_FAILED) {
-      munmap(virtual_base, HW_REGS_SPAN);
+      munmap(virtual_base, DDR3_SPAN);
     }
     close(mem_fd);
   }
 
   M7Regs read_m7_registers() {
+    // =================================================================
+    // Phase 4 Task 4.1: read the 8 Mode 7 registers from the FPGA's
+    // DDR3 mailbox (written at the top of every frame by the mailbox
+    // writer in SNES.sv). The mailbox sits at the very start of our
+    // mmap region (0x3E000000-0x3E00000F). volatile because it's
+    // updated by the FPGA concurrently with our reads.
+    // =================================================================
     M7Regs regs;
-    *hps_ext_ptr = CMD_M7_READ;
-
-    regs.a = *hps_ext_ptr;
-    regs.b = *hps_ext_ptr;
-    regs.c = *hps_ext_ptr;
-    regs.d = *hps_ext_ptr;
-    regs.x = *hps_ext_ptr & 0x1FFF; // 13-bit
-    regs.y = *hps_ext_ptr & 0x1FFF;
-    regs.hofs = *hps_ext_ptr & 0x1FFF;
-    regs.vofs = *hps_ext_ptr & 0x1FFF;
-
-    if (regs.x & 0x1000)
-      regs.x |= 0xE000;
-    if (regs.y & 0x1000)
-      regs.y |= 0xE000;
-    if (regs.hofs & 0x1000)
-      regs.hofs |= 0xE000;
-    if (regs.vofs & 0x1000)
-      regs.vofs |= 0xE000;
-
+    regs.a    = static_cast<int16_t>(mailbox_regs[0]);
+    regs.b    = static_cast<int16_t>(mailbox_regs[1]);
+    regs.c    = static_cast<int16_t>(mailbox_regs[2]);
+    regs.d    = static_cast<int16_t>(mailbox_regs[3]);
+    regs.x    = static_cast<int16_t>(mailbox_regs[4]);
+    regs.y    = static_cast<int16_t>(mailbox_regs[5]);
+    regs.hofs = static_cast<int16_t>(mailbox_regs[6]);
+    regs.vofs = static_cast<int16_t>(mailbox_regs[7]);
     return regs;
   }
 
-  void write_m7_pixels(const std::vector<uint16_t> &hd_pixels) {
-    *hps_ext_ptr = CMD_M7_WRITE_PIXELS;
+  // Updated to write directly to the 1D RAM array based on the scanline
+  void write_m7_pixels(const std::vector<uint16_t> &hd_pixels, int scanline) {
+    // Calculate where in our 1D RAM array this row of pixels starts
+    int pixel_offset = scanline * hd_width;
 
-    // Burst the exact number of dynamically scaled pixels
+    // Dump the exact number of dynamically scaled pixels into the RAM array
     for (int i = 0; i < hd_width; ++i) {
-      *hps_ext_ptr = hd_pixels[i];
+      // Writing the 16-bit RGB565 pixel into the 32-bit RAM slot
+      hd_pixel_buffer[pixel_offset + i] = hd_pixels[i];
     }
   }
 
   std::vector<uint16_t> render_hd_scanline(const M7Regs &regs, int scanline) {
-    // Allocate vector sized to our dynamic HD width
     std::vector<uint16_t> pixels(hd_width, 0);
 
     int y_screen = scanline;
     int cy = y_screen + regs.vofs - regs.y;
 
     for (int x_screen = 0; x_screen < hd_width; ++x_screen) {
-      // Map the high-res screen X coordinate back to native 0..255 space
-      // E.g. if multiplier is 4x, every 4 pixels map to 1 native unit
       int cx = (x_screen / scale_multiplier) + regs.hofs - regs.x;
 
       int map_x = ((regs.a * cx) + (regs.b * cy)) >> 8;
@@ -193,7 +195,6 @@ public:
       map_x += regs.x;
       map_y += regs.y;
 
-      // Placeholder map rendering pattern
       uint16_t rgb565 = ((map_x & 0x1F) << 11) | ((map_y & 0x3F) << 5);
       pixels[x_screen] = rgb565;
     }
@@ -209,7 +210,11 @@ public:
       for (int scanline = 0; scanline < SNES_HEIGHT; ++scanline) {
         M7Regs regs = read_m7_registers();
         std::vector<uint16_t> hd_pixels = render_hd_scanline(regs, scanline);
-        write_m7_pixels(hd_pixels);
+
+        // Pass the scanline index so the array knows exactly where to put the
+        // pixels!
+        write_m7_pixels(hd_pixels, scanline);
+
         usleep(64);
       }
     }

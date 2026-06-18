@@ -623,15 +623,16 @@ wire        frame_out;
 wire [23:0] hd_pixel_in;
 wire        hd_mode7_en;
 
-wire [8:0]  buf_wr_addr;
-wire [23:0] buf_wr_data;
-wire        buf_wr_en;
-wire        buf_arm;
-
+// Phase 3: buf_wr_* are now driven by the DMA reader (reg, declared later
+// near the state machine). Linebuf module wants 11-bit addr for up to 2047
+// pixels; keep widths consistent here.
 wire [3:0]  m7_scale_wire;
 assign M7_SCALE    = m7_scale_wire;
 assign HD_MODE7_EN = hd_mode7_en;
 assign HD_PIXEL_IN = hd_pixel_in;
+
+wire [8:0] ppu_x;
+wire [8:0] ppu_y;
 
 hd_mode7_linebuf linebuf (
     .clk_sys(clk_sys),
@@ -818,7 +819,11 @@ main main
 	.SS_DDR_REQ(ss_ddr_req),
 
 	.AUDIO_L(main_audio_l),
-	.AUDIO_R(main_audio_r)
+	.AUDIO_R(main_audio_r),
+
+	// Phase 1 Task 1.3: raw electron-gun counters from PPU (via main)
+	.HCOUNT_OUT(ppu_x),
+	.VCOUNT_OUT(ppu_y)
 );
 
 assign AUDIO_L = audio_l;
@@ -1514,11 +1519,10 @@ hps_ext hps_ext
 	.m7hofs_in(m7hofs_out),
 	.m7vofs_in(m7vofs_out),
 
-	// Phase 2 Task 2.2: Line buffer write outputs
-	.buf_wr_addr(buf_wr_addr),
-	.buf_wr_data(buf_wr_data),
-	.buf_wr_en(buf_wr_en),
-	.buf_arm(buf_arm),
+	// Phase 3 Task 3.6: DMA reader now owns the linebuf write path.
+	// hps_ext is no longer permitted to drive buf_wr_* (would cause a
+	// multiple-driver collision). Only CMD_M7_READ and CMD_M7_SET_SCALE
+	// remain on this instance.
 	.m7_scale(m7_scale_wire)
 );
 
@@ -1597,7 +1601,53 @@ wire        msu_ram_req;
 wire        msu_ram_ack;
 wire [63:0] msu_ram_dout;
 
-assign DDRAM_CLK = clk_mem;
+//assign DDRAM_CLK = clk_mem;
+
+// ===========================================================================
+// Phase 4 Task 4.1: M7 Register Mailbox Writer
+// Writes the 8 Mode 7 registers (M7A/M7B/M7C/M7D/M7X/M7Y/M7HOFS/M7VOFS) into
+// DDR3 at 0x3E000000-0x3E00000F once per frame (on the FRAME_OUT pulse).
+// The daemon mmaps this region and reads them as 16-bit values.
+//
+// Routes through the ddram module's existing 16-bit write path
+// (wraddr/din/we_req/we_ack) — no arbiter changes needed since that path
+// was previously unconnected.
+// ===========================================================================
+localparam [29:0] MB_BASE_ADDR = 30'h3E000000 >> 1; // [31:1] port: byte/2
+
+reg  [31:1] mb_wraddr;
+reg  [15:0] mb_din;
+reg         mb_we_req = 1'b0;
+wire        mb_we_ack;
+reg  [2:0]  mb_idx;
+reg         mb_busy;
+
+always @(posedge clk_sys) begin
+	if (frame_out) begin
+		mb_idx   <= 3'd0;
+		mb_busy  <= 1'b1;
+	end else if (mb_busy && (mb_we_req == mb_we_ack)) begin
+		// Previous write (if any) has been acked. Issue the next one.
+		mb_wraddr <= (MB_BASE_ADDR << 1) | {mb_idx, 1'b0};
+		mb_we_req <= ~mb_we_req;
+		if (mb_idx == 3'd7) mb_busy <= 1'b0;
+		else                mb_idx  <= mb_idx + 3'd1;
+	end
+end
+
+// Register-value mux (matches the byte ordering the daemon expects).
+always @(*) begin
+	case (mb_idx)
+		3'd0: mb_din = m7a_out;
+		3'd1: mb_din = m7b_out;
+		3'd2: mb_din = m7c_out;
+		3'd3: mb_din = m7d_out;
+		3'd4: mb_din = {3'b000, m7x_out};
+		3'd5: mb_din = {3'b000, m7y_out};
+		3'd6: mb_din = {3'b000, m7hofs_out};
+		3'd7: mb_din = {3'b000, m7vofs_out};
+	endcase
+end
 
 msu_data_store msu_data_store
 (
@@ -1622,17 +1672,23 @@ ddram ddram
 (
 	.DDRAM_CLK(DDRAM_CLK),
 
-	.DDRAM_BUSY(DDRAM_BUSY),
-	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
-	.DDRAM_ADDR(DDRAM_ADDR),
-	.DDRAM_DOUT(DDRAM_DOUT),
-	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
-	.DDRAM_RD(DDRAM_RD),
-	.DDRAM_DIN(DDRAM_DIN),
-	.DDRAM_BE(DDRAM_BE),
-	.DDRAM_WE(DDRAM_WE),
+	.DDRAM_ADDR(cache_DDRAM_ADDR),
+	.DDRAM_DOUT(cache_DDRAM_DOUT),
+	.DDRAM_RD(cache_DDRAM_RD),
+	.DDRAM_WE(cache_DDRAM_WE),
+	.DDRAM_DIN(cache_DDRAM_DIN),
+	.DDRAM_BURSTCNT(cache_DDRAM_BURSTCNT),
+	.DDRAM_DOUT_READY(cache_DDRAM_DOUT_READY),
+	.DDRAM_BUSY(cache_DDRAM_BUSY),
 
 	.cache_rst(~RESET_N),
+
+	// Phase 4 Task 4.1: M7 register mailbox writer drives the previously
+	// unused 16-bit write port.
+	.wraddr(mb_wraddr),
+	.din(mb_din),
+	.we_req(mb_we_req),
+	.we_ack(mb_we_ack),
 
 	.rdaddr({11'b0011_1111_10, ss_ddr_addr[21:3]}), // Save states at $3F80.0000
 	.dout(ss_ddr_dout),
@@ -1679,5 +1735,194 @@ savestate_ui #(.INFO_TIMEOUT_BITS(25)) savestate_ui
 	.statusUpdate   (ss_status     ),
 	.selected_slot  (ss_slot       )
 );
+// ===========================================================================
+// DDR3 Shared Memory Arbiter
+// Routes physical RAM access between the Cache (MSU-1/SaveStates) and Mode 7 DMA
+// ===========================================================================
+wire        cache_DDRAM_RD;
+wire        cache_DDRAM_WE;
+wire [28:0] cache_DDRAM_ADDR;
+wire [63:0] cache_DDRAM_DIN;
+wire [7:0]  cache_DDRAM_BE;
+wire [7:0]  cache_DDRAM_BURSTCNT;
+reg  [63:0] cache_DDRAM_DOUT;
+reg         cache_DDRAM_DOUT_READY;
+reg         cache_DDRAM_BUSY;
+
+reg         dma_DDRAM_RD;
+reg  [28:0] dma_DDRAM_ADDR;
+reg  [63:0] dma_DDRAM_DOUT;
+reg         dma_DDRAM_DOUT_READY;
+reg         dma_DDRAM_BUSY;
+
+// Traffic cop state (0 = Cache active, 1 = DMA active)
+reg active_client; 
+
+always @(posedge clk_sys) begin
+    cache_DDRAM_DOUT_READY <= 1'b0;
+    dma_DDRAM_DOUT_READY   <= 1'b0;
+
+    // Route the incoming data to whoever asked for it
+    if (DDRAM_DOUT_READY) begin
+        if (active_client == 1'b1) begin
+            dma_DDRAM_DOUT <= DDRAM_DOUT;
+            dma_DDRAM_DOUT_READY <= 1'b1;
+        end else begin
+            cache_DDRAM_DOUT <= DDRAM_DOUT;
+            cache_DDRAM_DOUT_READY <= 1'b1;
+        end
+    end
+
+    // Lock the active client until the transaction finishes
+    if (!DDRAM_BUSY && !DDRAM_DOUT_READY) begin
+        if (dma_DDRAM_RD) begin
+            active_client <= 1'b1; // DMA gets priority!
+        end else if (cache_DDRAM_RD || cache_DDRAM_WE) begin
+            active_client <= 1'b0;
+        end
+    end
+end
+
+// Route physical outputs to the active client
+assign DDRAM_RD       = (active_client == 1'b1) ? dma_DDRAM_RD       : cache_DDRAM_RD;
+assign DDRAM_WE       = (active_client == 1'b1) ? 1'b0               : cache_DDRAM_WE;
+assign DDRAM_ADDR     = (active_client == 1'b1) ? dma_DDRAM_ADDR     : cache_DDRAM_ADDR;
+assign DDRAM_DIN      = (active_client == 1'b1) ? 64'd0              : cache_DDRAM_DIN;
+assign DDRAM_BE       = (active_client == 1'b1) ? 8'hFF              : 8'hFF; 
+assign DDRAM_BURSTCNT = (active_client == 1'b1) ? 8'd1               : cache_DDRAM_BURSTCNT;
+
+// Route busy signals so the inactive client knows to wait its turn
+always @(*) begin
+    cache_DDRAM_BUSY = DDRAM_BUSY;
+    dma_DDRAM_BUSY   = DDRAM_BUSY;
+
+    if (active_client == 1'b1) cache_DDRAM_BUSY = 1'b1;
+    if (active_client == 1'b0 && (cache_DDRAM_RD || cache_DDRAM_WE)) dma_DDRAM_BUSY = 1'b1;
+end
+
+// ===========================================================================
+// Phase 2: HD Mode 7 DDR3 Memory Reader (DMA)
+// ===========================================================================
+
+// 1. Hardwire the MiSTer memory clock. The arbiter above drives all other
+//    physical DDRAM_* outputs (RD/WE/ADDR/DIN/BE/BURSTCNT) — do NOT reassign
+//    them here, or you will create multiple-driver compile errors.
+assign DDRAM_CLK      = clk_sys;
+
+// 2. Memory Map Parameters
+//    Pixels live at 0x3E001000 (skipping the first 4 KB which is reserved
+//    for the Phase 4 register mailbox at 0x3E000000-0x3E00000F).
+//localparam DDR3_BASE_ADDR = 29'h3E001000;
+// Explicitly map the Linux physical address (0x3E001000) to the FPGA address space
+localparam DDR3_BASE_ADDR = 29'h1E001000;
+
+// Phase 3 Task 3.5: HD_WIDTH is parameterized by m7_scale (set via
+// CMD_M7_SET_SCALE ioctl). 1x=256, 2x=512, 3x=768, 4x=1024, 6x=1536.
+wire [10:0] HD_WIDTH       = m7_scale_wire * 11'd256;
+wire [15:0] HD_LINE_STRIDE = HD_WIDTH * 16'd4; // bytes per scanline (32-bit slots, RGB565 in low 16)
+
+// Phase 3 Task 3.1: scanline sync from PPU's raw H_CNT/V_CNT counters.
+wire [8:0]  current_scanline = ppu_y;
+reg         start_of_scanline;
+reg  [8:0]  ppu_x_prev;
+
+// Phase 3 Task 3.2: linebuf write-port outputs. These are the SOLE drivers
+// of the buf_wr_* wires — hps_ext has been disconnected (Phase 3.6).
+reg  [10:0] buf_wr_addr;
+reg  [23:0] buf_wr_data;
+reg         buf_wr_en;
+reg         buf_arm;
+
+// RGB565 -> RGB888 expansion (matches the formula in hps_ext.v).
+function [23:0] rgb565_to_888;
+    input [15:0] in;
+    begin
+        rgb565_to_888 = {in[15:11], in[15:13],   // R5 -> R8
+                         in[10:5],  in[10:9],    // G6 -> G8
+                         in[4:0],   in[4:2]};    // B5 -> B8
+    end
+endfunction
+
+// Scanline-start detector: raw H_CNT wrapping from end-of-line back to 0.
+always @(posedge clk_sys) begin
+    ppu_x_prev       <= ppu_x;
+    start_of_scanline <= (ppu_x == 9'd0) && (ppu_x_prev != 9'd0);
+end
+
+// 3. State Machine Setup
+typedef enum bit [2:0] {
+    STATE_IDLE,
+    STATE_REQ,
+    STATE_WAIT,
+    STATE_PUSH_P1,
+    STATE_PUSH_P2
+} dma_state_t;
+
+dma_state_t dma_state = STATE_IDLE;
+
+reg [28:0] current_read_addr;
+reg [10:0] pixels_fetched;
+reg [63:0] cached_64bit_data;
+
+always @(posedge clk_sys) begin
+    // Default pulses
+    dma_DDRAM_RD <= 1'b0;
+    buf_wr_en    <= 1'b0;
+    buf_arm      <= 1'b0;
+
+    case (dma_state)
+        STATE_IDLE: begin
+            // Wait for H_CNT wrap (= start of a new scanline). Skip when
+            // scale is 0 (HD Mode 7 disabled).
+            if (start_of_scanline && m7_scale_wire != 4'd0) begin
+                current_read_addr <= DDR3_BASE_ADDR + (HD_LINE_STRIDE * current_scanline);
+                pixels_fetched    <= 11'd0;
+                dma_state         <= STATE_REQ;
+            end
+        end
+
+        STATE_REQ: begin
+            if (!dma_DDRAM_BUSY) begin
+                dma_DDRAM_ADDR <= current_read_addr;
+                dma_DDRAM_RD   <= 1'b1;
+                dma_state      <= STATE_WAIT;
+            end
+        end
+
+        STATE_WAIT: begin
+            if (dma_DDRAM_DOUT_READY) begin
+                cached_64bit_data <= dma_DDRAM_DOUT;
+                dma_state         <= STATE_PUSH_P1;
+            end
+        end
+
+        STATE_PUSH_P1: begin
+            // First pixel: lower 16 bits of slot 0 (32-bit slot, RGB565 low)
+            buf_wr_addr <= pixels_fetched;
+            buf_wr_data <= rgb565_to_888(cached_64bit_data[15:0]);
+            buf_wr_en   <= 1'b1;
+            dma_state   <= STATE_PUSH_P2;
+        end
+
+        STATE_PUSH_P2: begin
+            // Second pixel: lower 16 bits of slot 1
+            buf_wr_addr <= pixels_fetched + 11'd1;
+            buf_wr_data <= rgb565_to_888(cached_64bit_data[47:32]);
+            buf_wr_en   <= 1'b1;
+
+            pixels_fetched    <= pixels_fetched + 11'd2;
+            current_read_addr <= current_read_addr + 29'd8; // next 64-bit chunk
+
+            // Did we finish the whole scanline? Note: pixels_fetched is the
+            // value BEFORE the increment above, so test against HD_WIDTH-2.
+            if (pixels_fetched >= (HD_WIDTH - 11'd2)) begin
+                dma_state <= STATE_IDLE;
+                buf_arm   <= 1'b1; // line complete: arm the linebuf for display
+            end else begin
+                dma_state <= STATE_REQ;
+            end
+        end
+    endcase
+end
 
 endmodule

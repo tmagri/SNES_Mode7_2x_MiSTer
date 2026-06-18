@@ -56,7 +56,9 @@ module hps_ext
 	output reg        buf_wr_en,
 	output reg        buf_arm,
 
-	output reg [3:0]  m7_scale
+	output reg [3:0]  m7_scale = 4'd4 // Phase 4: default 4x so HD works without
+	                                  // a CMD_M7_SET_SCALE ioctl (which requires
+	                                  // MiSTer framework integration — see daemon TODO).
 );
 
 assign EXT_BUS[15:0] = io_dout;
