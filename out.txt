@@ -1,0 +1,171 @@
+reg  [31:1] mb_wraddr;
+reg  [15:0] mb_din;
+reg         mb_we_req = 1'b0;
+wire        mb_we_ack;
+
+// --- Per-line M7 register capture BRAM ---
+// Port A: capture logic writes 8 regs per line during active display.
+// Port B: copy state machine reads sequentially during vblank.
+wire [10:0] m7_lb_wr_addr;
+reg  [10:0] m7_lb_rd_addr;
+wire [15:0] m7_lb_wr_data;
+wire        m7_lb_wr_en;
+wire [15:0] m7_lb_rd_data;
+
+`ifdef M7_2X_ENABLE
+dpram #(11) m7_linebuf (
+	.clock(clk_sys),
+	.address_a(m7_lb_wr_addr),
+	.data_a(m7_lb_wr_data),
+	.wren_a(m7_lb_wr_en),
+	.q_a(),
+	.address_b(m7_lb_rd_addr),
+	.wren_b(1'b0),
+	.q_b(m7_lb_rd_data)
+);
+`endif
+
+// Capture state (all registered)
+reg [7:0]  ml_line;
+reg [2:0]  ml_cap_idx;
+reg        ml_cap_active;
+reg [15:0] ml_a, ml_b, ml_c, ml_d;
+reg [12:0] ml_x, ml_y, ml_hofs, ml_vofs;
+
+`ifdef M7_2X_ENABLE
+// Per-line capture: at each start_of_scanline, latch all 8 register
+// values, then advance ml_cap_idx over 8 cycles. The BRAM port-A
+// signals below are COMBINATIONAL (derived from the registered state),
+// so address and data always agree.
+always @(posedge clk_sys) begin
+	if (frame_out) begin
+		ml_line       <= 8'd0;
+		ml_cap_active <= 1'b0;
+	end else if (start_of_scanline && ml_line < 8'd224) begin
+		ml_a    <= m7a_out;
+		ml_b    <= m7b_out;
+		ml_c    <= m7c_out;
+		ml_d    <= m7d_out;
+		ml_x    <= m7x_out;
+		ml_y    <= m7y_out;
+		ml_hofs <= m7hofs_out;
+		ml_vofs <= m7vofs_out;
+		ml_cap_idx    <= 3'd0;
+		ml_cap_active <= 1'b1;
+	end else if (ml_cap_active) begin
+		if (ml_cap_idx == 3'd7) begin
+			ml_cap_active <= 1'b0;
+			ml_line       <= ml_line + 8'd1;
+		end else begin
+			ml_cap_idx <= ml_cap_idx + 3'd1;
+		end
+	end
+end
+
+// Combinational BRAM port-A signals. Because these are derived from
+// registered values (ml_cap_idx etc.), the BRAM sees a stable address
+// and data at each posedge — no skew between them.
+assign m7_lb_wr_en   = ml_cap_active;
+assign m7_lb_wr_addr = {ml_line[7:0], ml_cap_idx};
+
+always @(*) begin
+	case (ml_cap_idx)
+		3'd0: m7_lb_wr_data = ml_a;
+		3'd1: m7_lb_wr_data = ml_b;
+		3'd2: m7_lb_wr_data = ml_c;
+		3'd3: m7_lb_wr_data = ml_d;
+		3'd4: m7_lb_wr_data = {3'b000, ml_x};
+		3'd5: m7_lb_wr_data = {3'b000, ml_y};
+		3'd6: m7_lb_wr_data = {3'b000, ml_hofs};
+		3'd7: m7_lb_wr_data = {3'b000, ml_vofs};
+		default: m7_lb_wr_data = 16'd0;
+	endcase
+end
+
+// --- Copy state machine ---
+typedef enum reg [2:0] {
+	CS_IDLE,     // wait for FRAME_OUT
+	CS_ML_DUMP,  // per-line mailbox: set BRAM read addr
+	CS_ML_DATA,  // per-line mailbox: BRAM valid → DDR3 write
+	CS_CHK,      // check dirty, advance to next region or start copy
+	CS_ADDR,     // assert shadow read address
+	CS_WR,       // shadow data valid → issue DDR3 write
+	CS_NEXT      // wait for ack, increment index or advance region
+} copy_state_t;
+
+copy_state_t copy_state = CS_IDLE;
+reg [15:0] copy_idx;
+reg [1:0]  copy_region; // 0 = VRAM1, 1 = VRAM2, 2 = CGRAM
+
+always @(posedge clk_sys) begin
+	case (copy_state)
+		CS_IDLE: begin
+			if (frame_out) begin
+				copy_idx    <= 16'd0;
+				cgram_dirty <= 1'b1;
+				copy_state  <= CS_ML_DUMP;
+			end
+		end
+
+		CS_ML_DUMP: begin
+			// Set BRAM read address for this entry; data valid next cycle.
+			if (mb_we_req == mb_we_ack) begin
+				m7_lb_rd_addr <= copy_idx[10:0];
+				copy_state    <= CS_ML_DATA;
+			end
+		end
+
+		CS_ML_DATA: begin
+			// BRAM data is valid now — write it to DDR3.
+			if (mb_we_req == mb_we_ack) begin
+				mb_wraddr <= MB_BASE_ADDR + {19'd0, copy_idx[10:0]};
+				mb_din    <= m7_lb_rd_data;
+				mb_we_req <= ~mb_we_req;
+				if (copy_idx == ML_ENTRY_COUNT - 1) begin
+					copy_idx    <= 16'd0;
+					copy_region <= 2'd0;
+					copy_state  <= CS_CHK;
+				end else begin
+					copy_idx   <= copy_idx + 16'd1;
+					copy_state <= CS_ML_DUMP;
+				end
+			end
+		end
+
+		CS_CHK: begin
+			case (copy_region)
+				2'd0: if (vram1_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
+				      else copy_region <= 2'd1;
+				2'd1: if (vram2_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
+				      else copy_region <= 2'd2;
+				2'd2: if (cgram_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
+				      else copy_state  <= CS_IDLE;
+				default: copy_state <= CS_IDLE;
+			endcase
+		end
+
+		CS_ADDR: begin
+			// Assert shadow read address; data will be valid next cycle.
+			case (copy_region)
+				2'd0, 2'd1: vram_mirror_addr <= copy_idx[13:0];
+				2'd2:       cgram_mirror_addr <= copy_idx[7:0];
+			endcase
+			copy_state <= CS_WR;
+		end
+
+		CS_WR: begin
+			// Shadow data is valid now. Issue the DDR3 write.
+			if (mb_we_req == mb_we_ack) begin
+				case (copy_region)
+					2'd0: begin
+						mb_wraddr <= VRAM1_DDR3_BASE + {16'd0, copy_idx[13:0]};
+						mb_din    <= {8'd0, vram1_mirror_q};
+					end
+					2'd1: begin
+						mb_wraddr <= VRAM2_DDR3_BASE + {16'd0, copy_idx[13:0]};
+						mb_din    <= {8'd0, vram2_mirror_q};
+					end
+					2'd2: begin
+						mb_wraddr <= CGRAM_DDR3_BASE + {23'd0, copy_idx[7:0]};
+						mb_din    <= cgram_mirror_q;
+					end

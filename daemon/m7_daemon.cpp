@@ -64,6 +64,10 @@ private:
   const uint16_t *vram2_mirror;
   const uint16_t *cgram_mirror;   // 256 entries, 15-bit BGR555
 
+  uint16_t local_vram1[32768];
+  uint16_t local_vram2[32768];
+  uint16_t local_cgram[256];
+
   int scale_multiplier;
   int hd_width;
 
@@ -203,20 +207,20 @@ public:
       int tile_x = (wx >> 3) & 0x7F;
       int tile_y = (wy >> 3) & 0x7F;
       int tilemap_addr = (tile_y << 7) | tile_x;
-      uint8_t tile_number = vram1_mirror[tilemap_addr] & 0xFF;
+      uint8_t tile_number = local_vram1[tilemap_addr] & 0xFF;
 
       // --- Tile pixel lookup --------------------------------------------
       // byte address = {tile_number[7:0], row[2:0], col[2:0]} (14-bit)
       int col = wx & 7;
       int row = wy & 7;
       int tile_addr = (tile_number << 6) | (row << 3) | col;
-      uint8_t bg1_index = vram1_mirror[tile_addr] & 0xFF;
+      uint8_t bg1_index = local_vram1[tile_addr] & 0xFF;
 
       // --- EXTBG (BG2) layer --------------------------------------------
       // VRAM2 high byte: bit 7 = priority, bits 6-0 = color index (into
       // CGRAM at offset +128). Only meaningful when the game enables BG2
       // in Mode 7, but rendering it unconditionally is harmless.
-      uint8_t extbg_byte = vram2_mirror[tile_addr] & 0xFF;
+      uint8_t extbg_byte = local_vram2[tile_addr] & 0xFF;
       bool    extbg_pri  = extbg_byte & 0x80;
       uint8_t extbg_idx  = extbg_byte & 0x7F;
 
@@ -225,9 +229,9 @@ public:
       //   BG2 wins if it is opaque AND (it has priority OR BG1 is transparent)
       uint16_t rgb565;
       if (extbg_idx != 0 && (extbg_pri || bg1_index == 0)) {
-        rgb565 = bgr555_to_rgb565(cgram_mirror[128 + extbg_idx]);
+        rgb565 = bgr555_to_rgb565(local_cgram[128 + extbg_idx]);
       } else {
-        rgb565 = bgr555_to_rgb565(cgram_mirror[bg1_index]);
+        rgb565 = bgr555_to_rgb565(local_cgram[bg1_index]);
       }
 
       pixels[x_screen] = rgb565;
@@ -253,6 +257,12 @@ public:
       struct timespec t0, t1;
       clock_gettime(CLOCK_MONOTONIC, &t0);
 
+      // Copy mirrors to local cached RAM to avoid saturating the DDR3 bus
+      // with millions of uncached random reads over the AXI bridge.
+      std::memcpy(local_vram1, (const void*)vram1_mirror, 32768 * sizeof(uint16_t));
+      std::memcpy(local_vram2, (const void*)vram2_mirror, 32768 * sizeof(uint16_t));
+      std::memcpy(local_cgram, (const void*)cgram_mirror, 256 * sizeof(uint16_t));
+
       // Read per-line registers for each scanline so HDMA changes
       // (SMK perspective, etc.) are captured correctly.
       for (int scanline = 0; scanline < SNES_HEIGHT; ++scanline) {
@@ -261,16 +271,18 @@ public:
         write_m7_pixels(hd_pixels, scanline);
       }
 
-      // Pace to ~60 Hz so we don't starve the ARM.
+      // Pace to ~60 Hz so we don't starve the ARM and SPI DMA.
       clock_gettime(CLOCK_MONOTONIC, &t1);
       long elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
       long sleep_ns = FRAME_NS - elapsed_ns;
-      if (sleep_ns > 1000000L) {
-        struct timespec rem = {0, sleep_ns};
-        nanosleep(&rem, nullptr);
-      } else {
-        sched_yield();
+
+      // Force at least 2ms of sleep per frame to guarantee the MiSTer Main process 
+      // and SPI DMA have enough memory bandwidth to poll controllers without dropping packets.
+      if (sleep_ns < 2000000L) {
+        sleep_ns = 2000000L;
       }
+      struct timespec rem = {0, sleep_ns};
+      nanosleep(&rem, nullptr);
     }
   }
 };

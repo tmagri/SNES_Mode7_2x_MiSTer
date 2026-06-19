@@ -1088,6 +1088,12 @@ reg [13:0] vram_mirror_addr;
 wire [7:0]  vram1_mirror_q;
 wire [7:0]  vram2_mirror_q;
 reg [7:0]  cgram_mirror_addr;
+
+`ifndef M7_2X_ENABLE
+always @(*) begin
+    cgram_mirror_addr = 8'd0;
+end
+`endif
 wire [14:0] cgram_mirror_q;
 
 reg vram1_dirty, vram2_dirty, cgram_dirty;
@@ -1699,6 +1705,13 @@ localparam [15:0] ML_ENTRY_COUNT  = 16'd1792; // 224 lines × 8 regs
 // --- DDR3 16-bit write port signals (shared by all regions) ---
 reg  [31:1] mb_wraddr;
 reg  [15:0] mb_din;
+
+`ifndef M7_2X_ENABLE
+always @(*) begin
+    mb_wraddr = 31'd0;
+    mb_din = 16'd0;
+end
+`endif
 reg         mb_we_req = 1'b0;
 wire        mb_we_ack;
 
@@ -2022,8 +2035,15 @@ reg  [63:0] dma_DDRAM_DOUT;
 reg         dma_DDRAM_DOUT_READY;
 reg         dma_DDRAM_BUSY;
 
+`ifndef M7_2X_ENABLE
+always @(*) begin
+    dma_DDRAM_RD = 1'b0;
+    dma_DDRAM_ADDR = 29'd0;
+end
+`endif
+
 // Traffic cop state (0 = Cache active, 1 = DMA active)
-reg active_client; 
+reg active_client = 1'b0; 
 
 // Phase B5: round-robin fairness. Previously DMA had absolute priority
 // whenever dma_DDRAM_RD pulsed, which runs every scanline (~15.7 kHz) and
@@ -2033,12 +2053,15 @@ reg active_client;
 wire cache_wants = (cache_DDRAM_RD || cache_DDRAM_WE);
 wire dma_wants   = dma_DDRAM_RD;
 
+reg transaction_pending = 1'b0;
+
 always @(posedge clk_sys) begin
     cache_DDRAM_DOUT_READY <= 1'b0;
     dma_DDRAM_DOUT_READY   <= 1'b0;
 
     // Route the incoming data to whoever asked for it
     if (DDRAM_DOUT_READY) begin
+        transaction_pending <= 1'b0;
         if (active_client == 1'b1) begin
             dma_DDRAM_DOUT <= DDRAM_DOUT;
             dma_DDRAM_DOUT_READY <= 1'b1;
@@ -2046,20 +2069,34 @@ always @(posedge clk_sys) begin
             cache_DDRAM_DOUT <= DDRAM_DOUT;
             cache_DDRAM_DOUT_READY <= 1'b1;
         end
+    end else if (DDRAM_RD && !DDRAM_BUSY) begin
+        transaction_pending <= 1'b1;
     end
 
     // When the bus is idle, pick the next client. Round-robin: if both
-    // want the bus, whoever was NOT the last active client wins. This
-    // guarantees neither client can starve the other.
-    if (!DDRAM_BUSY && !DDRAM_DOUT_READY) begin
-        if (active_client == 1'b1) begin
-            // DMA just finished; prefer cache if it has anything pending.
-            if (cache_wants)        active_client <= 1'b0;
-            else if (dma_wants)     active_client <= 1'b1;
-        end else begin
-            // Cache just finished; prefer DMA if it has anything pending.
-            if (dma_wants)          active_client <= 1'b1;
-            else if (cache_wants)   active_client <= 1'b0;
+    // want the bus, whoever was NOT the last active client wins.
+    if (!transaction_pending) begin
+        // Switch ONLY when the current transaction is fully complete.
+        // A write is complete immediately when accepted (!DDRAM_BUSY).
+        if ((active_client == 1'b1 && !dma_wants) || 
+            (active_client == 1'b0 && !cache_wants) || 
+            (DDRAM_WE && !DDRAM_BUSY)) begin
+            
+            if (active_client == 1'b1) begin
+                if (cache_wants) active_client <= 1'b0;
+            end else begin
+                if (dma_wants)   active_client <= 1'b1;
+            end
+        end
+    end else begin
+        // If a read is pending, we must wait until it returns.
+        // We can switch the cycle the data arrives to maintain throughput.
+        if (DDRAM_DOUT_READY) begin
+            if (active_client == 1'b1) begin
+                if (cache_wants) active_client <= 1'b0;
+            end else begin
+                if (dma_wants)   active_client <= 1'b1;
+            end
         end
     end
 end
@@ -2069,7 +2106,7 @@ assign DDRAM_RD       = (active_client == 1'b1) ? dma_DDRAM_RD       : cache_DDR
 assign DDRAM_WE       = (active_client == 1'b1) ? 1'b0               : cache_DDRAM_WE;
 assign DDRAM_ADDR     = (active_client == 1'b1) ? dma_DDRAM_ADDR     : cache_DDRAM_ADDR;
 assign DDRAM_DIN      = (active_client == 1'b1) ? 64'd0              : cache_DDRAM_DIN;
-assign DDRAM_BE       = (active_client == 1'b1) ? 8'hFF              : 8'hFF; 
+assign DDRAM_BE       = (active_client == 1'b1) ? 8'hFF              : cache_DDRAM_BE; 
 assign DDRAM_BURSTCNT = (active_client == 1'b1) ? 8'd1               : cache_DDRAM_BURSTCNT;
 
 // Route busy signals so the inactive client knows to wait its turn

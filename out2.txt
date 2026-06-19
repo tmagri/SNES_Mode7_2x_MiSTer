@@ -1,0 +1,61 @@
+// VRAM mirrors use dirty flags (skip when static). CGRAM is always copied.
+// ===========================================================================
+localparam [29:0] MB_BASE_ADDR    = 30'h3E000000 >> 1;
+localparam [31:1] VRAM1_DDR3_BASE = 31'h1F080000; // 0x3E100000 >> 1
+localparam [31:1] VRAM2_DDR3_BASE = 31'h1F084000; // 0x3E108000 >> 1
+localparam [31:1] CGRAM_DDR3_BASE = 31'h1F088000; // 0x3E110000 >> 1
+localparam [15:0] ML_LINE_COUNT   = 16'd224;  // active display lines
+localparam [15:0] ML_ENTRY_COUNT  = 16'd1792; // 224 lines × 8 regs
+
+// --- DDR3 16-bit write port signals (shared by all regions) ---
+reg  [31:1] mb_wraddr;
+reg  [15:0] mb_din;
+reg         mb_we_req = 1'b0;
+wire        mb_we_ack;
+
+// --- Per-line M7 register capture BRAM ---
+// Port A: capture logic writes 8 regs per line during active display.
+// Port B: copy state machine reads sequentially during vblank.
+wire [10:0] m7_lb_wr_addr;
+reg  [10:0] m7_lb_rd_addr;
+wire [15:0] m7_lb_wr_data;
+wire        m7_lb_wr_en;
+wire [15:0] m7_lb_rd_data;
+
+`ifdef M7_2X_ENABLE
+dpram #(11) m7_linebuf (
+	.clock(clk_sys),
+	.address_a(m7_lb_wr_addr),
+	.data_a(m7_lb_wr_data),
+	.wren_a(m7_lb_wr_en),
+	.q_a(),
+	.address_b(m7_lb_rd_addr),
+	.wren_b(1'b0),
+	.q_b(m7_lb_rd_data)
+);
+`endif
+
+// Capture state (all registered)
+reg [7:0]  ml_line;
+reg [2:0]  ml_cap_idx;
+reg        ml_cap_active;
+reg [15:0] ml_a, ml_b, ml_c, ml_d;
+reg [12:0] ml_x, ml_y, ml_hofs, ml_vofs;
+
+`ifdef M7_2X_ENABLE
+// Per-line capture: at each start_of_scanline, latch all 8 register
+// values, then advance ml_cap_idx over 8 cycles. The BRAM port-A
+// signals below are COMBINATIONAL (derived from the registered state),
+// so address and data always agree.
+always @(posedge clk_sys) begin
+	if (frame_out) begin
+		ml_line       <= 8'd0;
+		ml_cap_active <= 1'b0;
+	end else if (start_of_scanline && ml_line < 8'd224) begin
+		ml_a    <= m7a_out;
+		ml_b    <= m7b_out;
+		ml_c    <= m7c_out;
+		ml_d    <= m7d_out;
+		ml_x    <= m7x_out;
+		ml_y    <= m7y_out;
+		ml_hofs <= m7hofs_out;

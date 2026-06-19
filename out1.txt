@@ -1,0 +1,31 @@
+// game isn't modifying VRAM (common during SMK races).
+//
+// BRAM conservation: Mode 7 only uses the first 16K entries of each VRAM
+// bank (tilemap 128×128 + tile data 256×64 = 16384 entries each). The
+// mirrors are 16K-deep (14-bit address), not 32K, to fit within the
+// Cyclone V's 553 M10K blocks.
+// ===========================================================================
+reg [13:0] vram_mirror_addr;
+wire [7:0]  vram1_mirror_q;
+wire [7:0]  vram2_mirror_q;
+reg [7:0]  cgram_mirror_addr;
+wire [14:0] cgram_mirror_q;
+
+reg vram1_dirty, vram2_dirty, cgram_dirty;
+
+`ifdef M7_2X_ENABLE
+dpram #(14) vram1_mirror
+(
+	.clock(clk_sys),
+	.address_a(VRAM1_ADDR[13:0]),
+	.data_a(VRAM1_D),
+	.wren_a(~VRAM1_WE_N),
+	.address_b(vram_mirror_addr),
+	.wren_b(1'b0),
+	.q_b(vram1_mirror_q)
+);
+
+dpram #(14) vram2_mirror
+(
+	.clock(clk_sys),
+	.address_a(VRAM2_ADDR[13:0]),

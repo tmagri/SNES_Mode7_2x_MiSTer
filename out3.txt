@@ -1,0 +1,181 @@
+	.ss_info_req    (ss_info_req   ),
+	.ss_info        (ss_info       ),
+	.statusUpdate   (ss_status     ),
+	.selected_slot  (ss_slot       )
+);
+// ===========================================================================
+// DDR3 Shared Memory Arbiter
+// Routes physical RAM access between the Cache (MSU-1/SaveStates) and Mode 7 DMA
+// ===========================================================================
+wire        cache_DDRAM_RD;
+wire        cache_DDRAM_WE;
+wire [28:0] cache_DDRAM_ADDR;
+wire [63:0] cache_DDRAM_DIN;
+wire [7:0]  cache_DDRAM_BE;
+wire [7:0]  cache_DDRAM_BURSTCNT;
+reg  [63:0] cache_DDRAM_DOUT;
+reg         cache_DDRAM_DOUT_READY;
+reg         cache_DDRAM_BUSY;
+
+reg         dma_DDRAM_RD;
+reg  [28:0] dma_DDRAM_ADDR;
+reg  [63:0] dma_DDRAM_DOUT;
+reg         dma_DDRAM_DOUT_READY;
+reg         dma_DDRAM_BUSY;
+
+// Traffic cop state (0 = Cache active, 1 = DMA active)
+reg active_client; 
+
+// Phase B5: round-robin fairness. Previously DMA had absolute priority
+// whenever dma_DDRAM_RD pulsed, which runs every scanline (~15.7 kHz) and
+// starved the cache path (MSU-1 audio, save states). Now when the bus is
+// free and BOTH clients want it, we alternate based on who was served
+// last. Single-requestor cases still get immediate service.
+wire cache_wants = (cache_DDRAM_RD || cache_DDRAM_WE);
+wire dma_wants   = dma_DDRAM_RD;
+
+always @(posedge clk_sys) begin
+    cache_DDRAM_DOUT_READY <= 1'b0;
+    dma_DDRAM_DOUT_READY   <= 1'b0;
+
+    // Route the incoming data to whoever asked for it
+    if (DDRAM_DOUT_READY) begin
+        if (active_client == 1'b1) begin
+            dma_DDRAM_DOUT <= DDRAM_DOUT;
+            dma_DDRAM_DOUT_READY <= 1'b1;
+        end else begin
+            cache_DDRAM_DOUT <= DDRAM_DOUT;
+            cache_DDRAM_DOUT_READY <= 1'b1;
+        end
+    end
+
+    // When the bus is idle, pick the next client. Round-robin: if both
+    // want the bus, whoever was NOT the last active client wins. This
+    // guarantees neither client can starve the other.
+    if (!DDRAM_BUSY && !DDRAM_DOUT_READY) begin
+        if (active_client == 1'b1) begin
+            // DMA just finished; prefer cache if it has anything pending.
+            if (cache_wants)        active_client <= 1'b0;
+            else if (dma_wants)     active_client <= 1'b1;
+        end else begin
+            // Cache just finished; prefer DMA if it has anything pending.
+            if (dma_wants)          active_client <= 1'b1;
+            else if (cache_wants)   active_client <= 1'b0;
+        end
+    end
+end
+
+// Route physical outputs to the active client
+assign DDRAM_RD       = (active_client == 1'b1) ? dma_DDRAM_RD       : cache_DDRAM_RD;
+assign DDRAM_WE       = (active_client == 1'b1) ? 1'b0               : cache_DDRAM_WE;
+assign DDRAM_ADDR     = (active_client == 1'b1) ? dma_DDRAM_ADDR     : cache_DDRAM_ADDR;
+assign DDRAM_DIN      = (active_client == 1'b1) ? 64'd0              : cache_DDRAM_DIN;
+assign DDRAM_BE       = (active_client == 1'b1) ? 8'hFF              : 8'hFF; 
+assign DDRAM_BURSTCNT = (active_client == 1'b1) ? 8'd1               : cache_DDRAM_BURSTCNT;
+
+// Route busy signals so the inactive client knows to wait its turn
+always @(*) begin
+    cache_DDRAM_BUSY = DDRAM_BUSY;
+    dma_DDRAM_BUSY   = DDRAM_BUSY;
+
+    if (active_client == 1'b1) cache_DDRAM_BUSY = 1'b1;
+    if (active_client == 1'b0 && (cache_DDRAM_RD || cache_DDRAM_WE)) dma_DDRAM_BUSY = 1'b1;
+end
+
+// ===========================================================================
+// Phase 2: HD Mode 7 DDR3 Memory Reader (DMA)
+// ===========================================================================
+
+// 1. Hardwire the MiSTer memory clock. The arbiter above drives all other
+//    physical DDRAM_* outputs (RD/WE/ADDR/DIN/BE/BURSTCNT) — do NOT reassign
+//    them here, or you will create multiple-driver compile errors.
+assign DDRAM_CLK      = clk_sys;
+
+`ifdef M7_2X_ENABLE
+// 2. Memory Map Parameters
+//    The DMA reader bypasses the ddram module and drives DDRAM_ADDR
+//    directly. DDRAM_ADDR is a 64-bit WORD address: physical byte address
+//    = DDRAM_ADDR × 8. The daemon writes pixels at physical byte address
+//    0x3E002000, so the word-address base is 0x3E002000 >> 3 = 0x07C00400.
+//    Per-read advance is +1 word (= 8 bytes).
+localparam [28:0] DDR3_BASE_ADDR = 29'h07C00400;
+
+// Phase 3 Task 3.5: HD_WIDTH is parameterized by m7_scale.
+// 1x=256, 2x=512, 3x=768, 4x=1024, 6x=1536.
+wire [10:0] HD_WIDTH       = m7_scale_wire * 11'd256;
+// C.4: pixels are 16-bit packed (RGB565), 4 pixels per 64-bit word.
+// Stride is in WORDS (not bytes): HD_WIDTH / 4.
+wire [15:0] HD_LINE_STRIDE = HD_WIDTH / 16'd4;
+
+// Phase 3 Task 3.1: scanline sync from PPU's raw H_CNT/V_CNT counters.
+wire [8:0]  current_scanline = ppu_y;
+reg         start_of_scanline;
+reg  [8:0]  ppu_x_prev;
+
+// Phase 3 Task 3.2: linebuf write-port outputs. These are the SOLE drivers
+// of the buf_wr_* wires — hps_ext has been disconnected (Phase 3.6).
+reg  [10:0] buf_wr_addr;
+reg  [23:0] buf_wr_data;
+reg         buf_wr_en;
+reg         buf_arm;
+
+// RGB565 -> RGB888 expansion (matches the formula in hps_ext.v).
+function [23:0] rgb565_to_888;
+    input [15:0] in;
+    begin
+        rgb565_to_888 = {in[15:11], in[15:13],   // R5 -> R8
+                         in[10:5],  in[10:9],    // G6 -> G8
+                         in[4:0],   in[4:2]};    // B5 -> B8
+    end
+endfunction
+
+// Scanline-start detector: raw H_CNT wrapping from end-of-line back to 0.
+always @(posedge clk_sys) begin
+    ppu_x_prev       <= ppu_x;
+    start_of_scanline <= (ppu_x == 9'd0) && (ppu_x_prev != 9'd0);
+end
+
+// 3. State Machine Setup
+// C.4 optimization: extract 4 pixels per 64-bit DDR3 read (the daemon
+// packs consecutive RGB565 values at 16-bit granularity). This halves
+// the number of DDR3 reads per scanline vs the previous 2-pixel design.
+typedef enum bit [2:0] {
+    STATE_IDLE,
+    STATE_REQ,
+    STATE_WAIT,
+    STATE_PUSH_P1,
+    STATE_PUSH_P2,
+    STATE_PUSH_P3,
+    STATE_PUSH_P4
+} dma_state_t;
+
+dma_state_t dma_state = STATE_IDLE;
+
+reg [28:0] current_read_addr;
+reg [10:0] pixels_fetched;
+reg [63:0] cached_64bit_data;
+
+always @(posedge clk_sys) begin
+    // Default pulses
+    dma_DDRAM_RD <= 1'b0;
+    buf_wr_en    <= 1'b0;
+    buf_arm      <= 1'b0;
+
+    case (dma_state)
+        STATE_IDLE: begin
+            if (start_of_scanline && m7_scale_wire != 4'd0) begin
+                current_read_addr <= DDR3_BASE_ADDR + (HD_LINE_STRIDE * current_scanline);
+                pixels_fetched    <= 11'd0;
+                dma_state         <= STATE_REQ;
+            end
+        end
+
+        STATE_REQ: begin
+            if (!dma_DDRAM_BUSY) begin
+                dma_DDRAM_ADDR <= current_read_addr;
+                dma_DDRAM_RD   <= 1'b1;
+                dma_state      <= STATE_WAIT;
+            end
+        end
+
+        STATE_WAIT: begin

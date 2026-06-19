@@ -115,3 +115,7 @@ Save-state hotkeys (F1–F4) now require **Alt** to avoid spurious popups:
 - Plain F1–F4: no savestate action (previously triggered load, which caused random "Loading state" popups)
 - Debug layer toggles (DEBUG builds only): F6–F10
 
+### Controller Bindings & Troubleshooting
+- **Random "Slot=DPAD" or "Saved to state" popups during gameplay:** If you experience random savestate slot changes or save/load messages popping up while playing, you have likely mapped the core's **SaveState** button to a common gameplay button (like a shoulder trigger or action button). 
+  - The `SaveState` button acts as a modifier: holding it and pressing the DPAD changes slots, and holding it while pressing Start+Up/Down triggers loads and saves. 
+  - **To fix:** Remap your controller in the MiSTer OSD and either skip the `SaveState` button assignment entirely, or map it to a dedicated unused button.
