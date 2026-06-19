@@ -124,6 +124,10 @@ module main (
 	input      [23:0] HD_PIXEL_IN,
 	input             HD_MODE7_EN,
 
+	// Phase C.1: CGRAM mirror read port for the DDR3 copy state machine.
+	input       [7:0] CGRAM_MIRROR_ADDR,
+	output     [14:0] CGRAM_MIRROR_Q,
+
 	// Phase 2: PPU rendering signals for line buffer sync
 	output      [8:0] X_OUT,
 	output            FRAME_OUT,
@@ -321,6 +325,10 @@ SNES SNES
 	// Phase 1: HD pixel mux inputs (tied off; Phase 2 will drive these from the line buffer)
 	.hd_pixel_in(HD_PIXEL_IN),
 	.hd_mode7_en(HD_MODE7_EN),
+
+	// Phase C.1: CGRAM mirror read port
+	.cgram_mirror_addr(CGRAM_MIRROR_ADDR),
+	.cgram_mirror_q(CGRAM_MIRROR_Q),
 
 	// Phase 2: PPU rendering signals for line buffer sync
 	.x_out(X_OUT),

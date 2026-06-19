@@ -1375,7 +1375,6 @@ wire        vga_de_sl, vga_ce_sl, vga_vs_sl, vga_hs_sl;
 // -------------------------------------------------------------------------
 wire [23:0] snes_rgb_out = de_emu ? {r_out, g_out, b_out} : 24'd0;
 
-reg [10:0] hd_x_coord = 0;
 reg [3:0]  scale_cnt = 0;
 reg [23:0] final_rgb_out;
 reg        final_ce_pixel;
@@ -1389,7 +1388,6 @@ always @(posedge clk_vid) begin
 	
 	// Reset X coordinate at HBLANK
 	if (~de_emu && hs_fix) begin
-		hd_x_coord <= 0;
 		scale_cnt <= 0;
 	end
 	// Start generating HD pixels when the native core emits a pixel pulse
@@ -1405,10 +1403,8 @@ always @(posedge clk_vid) begin
 		if (hd_mode7_en) begin
 			final_rgb_out <= hd_pixel_in;   
 		end else begin
-			final_rgb_out <= snes_rgb_out;  
+ 		final_rgb_out <= snes_rgb_out;  
 		end
-		
-		hd_x_coord <= hd_x_coord + 1'd1;
 		
 		if (scale_cnt == m7_scale) begin
 			scale_cnt <= 0; 
@@ -1802,7 +1798,6 @@ emu emu
 	.M7_SCALE(m7_scale),
     .HD_MODE7_EN(hd_mode7_en),
     .HD_PIXEL_IN(hd_pixel_in),
-	.HD_X_COORD(hd_x_coord),
 	.HPS_BUS({fb_en, sl, f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,
 				 ce_hpix, hde_emu, hhs_fix, hvs_fix, 

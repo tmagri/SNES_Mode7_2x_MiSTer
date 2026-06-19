@@ -40,6 +40,7 @@ wire pressed = ps2_key[9];
 always @(posedge clk) begin
 	reg old_state;
 	reg alt = 0;
+	reg shift = 0;
 	reg [1:0] old_st;
 
 	old_state <= ps2_key[10];
@@ -60,13 +61,23 @@ always @(posedge clk) begin
 	if(allow_ss) begin
 	
 		// keyboard
+		// F1-F4 are savestate hotkeys, but BOTH save and load now require
+		// Alt. This prevents plain F1-F4 (which also feed the debug-layer
+		// toggles in SNES.sv, and which the framework's PS/2 loop can
+		// emit spuriously when an ARM daemon is hammering /dev/mem) from
+		// triggering "Loading state" popups during normal play.
+		//   Alt       + Fn  -> Save to slot N
+		//   Alt+Shift + Fn  -> Load from slot N
+		//   plain     Fn    -> no savestate action (still toggles DBG layers)
 		if(old_state != ps2_key[10]) begin
 			case(ps2_key[7:0])
-				'h11: alt <= pressed;
-				'h05: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 0; statusUpdate <= 1'b1; end // F1
-				'h06: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 1; statusUpdate <= 1'b1; end // F2
-				'h04: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 2; statusUpdate <= 1'b1; end // F3
-				'h0C: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 3; statusUpdate <= 1'b1; end // F4
+				'h11: alt   <= pressed;       // Left Alt
+				'h12: shift <= pressed;       // Left Shift
+				'h59: shift <= pressed;       // Right Shift
+				'h05: begin ss_save <= pressed & alt & ~shift; ss_load <= pressed & alt & shift; ss_base <= 0; statusUpdate <= 1'b1; end // F1
+				'h06: begin ss_save <= pressed & alt & ~shift; ss_load <= pressed & alt & shift; ss_base <= 1; statusUpdate <= 1'b1; end // F2
+				'h04: begin ss_save <= pressed & alt & ~shift; ss_load <= pressed & alt & shift; ss_base <= 2; statusUpdate <= 1'b1; end // F3
+				'h0C: begin ss_save <= pressed & alt & ~shift; ss_load <= pressed & alt & shift; ss_base <= 3; statusUpdate <= 1'b1; end // F4
 			endcase
 		end
 	

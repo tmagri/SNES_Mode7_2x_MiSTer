@@ -56,6 +56,12 @@ set_global_assignment -name SEED 1
 #use only 1MB per frame for scaler to free more DDR3 RAM
 set_global_assignment -name VERILOG_MACRO "MISTER_SMALL_VBUF=1"
 
+# HD Mode 7 (2x) experimental rendering path. OFF by default: it adds ~40
+# M10K blocks (two 16K VRAM mirrors + HD line buffer) which exceeds the
+# Cyclone V's 553-block budget (Error 170048). Uncomment to enable the
+# feature (only fits on a larger part or with the mirrors redesigned).
+#set_global_assignment -name VERILOG_MACRO "M7_2X_ENABLE"
+
 source sys/sys.tcl
 source sys/sys_analog.tcl
 source files.qip

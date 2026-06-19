@@ -83,6 +83,12 @@ entity SPPU is
 		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);	-- 24-bit RGB from ARM
 		HD_MODE7_EN		: in std_logic;						-- '1' = ARM pixels valid, override PPU
 
+		-- Phase C.1: CGRAM mirror read port for the DDR3 VRAM/CGRAM copy.
+		-- A shadow dpram inside the PPU snoops all CGRAM writes; this port
+		-- lets the SNES.sv top-level read it out for the ARM daemon.
+		CGRAM_MIRROR_ADDR	: in  std_logic_vector(7 downto 0) := (others => '0');
+		CGRAM_MIRROR_Q		: out std_logic_vector(14 downto 0);
+
 		SS_A			: in std_logic_vector(7 downto 0);
 		SS_DO			: out std_logic_vector(7 downto 0)
 	);
@@ -401,11 +407,28 @@ port map(
 	data_a	 => CGRAM_D,
 	wren_a	 => CGRAM_WE,
 	q_a		 => CGRAM_Q,
-	
+
 	address_b => CGRAM_B_ADDR,
 	data_b	 => CGRAM_B_DATA,
 	wren_b	 => CGRAM_B_WE,
 	q_b		 => CGRAM_Q_B
+);
+
+-- Phase C.1: CGRAM shadow. Snoops all writes on the original CGRAM port A.
+-- Port B is dedicated to the DDR3 copy state machine in SNES.sv, which
+-- pushes the full 256-entry palette into DDR3 once per frame so the ARM
+-- daemon can render correct Mode 7 colors.
+CGRAM_SHADOW : entity work.dpram generic map(8,15)
+port map(
+	clock		 => CLK,
+	address_a => CGRAM_ADDR,
+	data_a	 => CGRAM_D,
+	wren_a	 => CGRAM_WE,
+	q_a		 => open,
+
+	address_b => CGRAM_MIRROR_ADDR,
+	wren_b	 => '0',
+	q_b		 => CGRAM_MIRROR_Q
 );
 
 CGRAM_ADDR_CLR <= CGRAM_ADDR_CLR + 1 when rising_edge(CLK);

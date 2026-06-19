@@ -132,6 +132,10 @@ entity SNES is
 		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);
 		HD_MODE7_EN		: in std_logic;
 
+		-- Phase C.1: CGRAM mirror read port for the DDR3 copy state machine.
+		CGRAM_MIRROR_ADDR	: in  std_logic_vector(7 downto 0) := (others => '0');
+		CGRAM_MIRROR_Q		: out std_logic_vector(14 downto 0);
+
 		-- Phase 2: PPU rendering signals for line buffer sync
 		X_OUT			: out std_logic_vector(8 downto 0);
 		FRAME_OUT		: out std_logic;
@@ -402,6 +406,10 @@ begin
 		-- Phase 1 Task 1.2: HD pixel mux inputs
 		HD_PIXEL_IN		=>	HD_PIXEL_IN,
 		HD_MODE7_EN		=>	HD_MODE7_EN,
+
+		-- Phase C.1: CGRAM mirror read port
+		CGRAM_MIRROR_ADDR	=>	CGRAM_MIRROR_ADDR,
+		CGRAM_MIRROR_Q	=>	CGRAM_MIRROR_Q,
 
 		-- Phase 2: PPU rendering signals for line buffer sync
 		X_OUT			=>	X_OUT,
