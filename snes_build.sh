@@ -97,38 +97,49 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Compiling $PROJECT_REVISION with $QUARTUS_IMAGE"
-"$DOCKER_BIN" run --rm \
+# Stage + hash INSIDE the compile container: the macOS-side VirtioFS dentry
+# cache has hidden freshly-written output_files entries for >10 minutes even
+# from the host's own ls, so the container is the only immediately-trustworthy
+# viewer. It stages under the launcher's name and prints RBF_MD5; the host
+# then polls until its (lazy) view of the file matches that hash — which also
+# guarantees a later scp deploys the bits that were just built, never a stale
+# copy that merely looks fresh.
+COMPILE_LOG=$(mktemp)
+if ! "$DOCKER_BIN" run --rm \
 	--platform linux/amd64 \
 	-v "$PROJECT_DIR:/build:rw" \
 	-w /build \
 	"$QUARTUS_IMAGE" \
-	bash -c "export PATH=\"\$PATH:/opt/intelFPGA_lite/17.0/quartus/bin:/intelFPGA_lite/17.0/quartus/bin\" && if ! grep -q '^[[:space:]]*set_global_assignment -name NUM_PARALLEL_PROCESSORS[[:space:]]' '$QSF_NAME'; then echo 'set_global_assignment -name NUM_PARALLEL_PROCESSORS 1' >> '$QSF_NAME'; fi && quartus_sh --flow compile '$QPF_NAME'"
-
-# The RBF can take a while to appear through the Docker bind mount (macOS
-# file-sync/dentry-cache lag hit >2 min on a 4.5 MB image). Re-listing the
-# directory each pass forces the VirtioFS cache to refresh before the -f test.
-RBF_OK=0
-for _ in $(seq 1 60); do
-	ls "$PROJECT_DIR/output_files/" >/dev/null 2>&1
-	if [[ -f "$RBF_FILE" ]]; then RBF_OK=1; break; fi
-	sleep 2
-done
-if [[ "$RBF_OK" != 1 ]]; then
-	# The macOS-side VirtioFS dentry cache can keep hiding the file long after
-	# the container wrote it — look from inside a container before failing.
-	if "$DOCKER_BIN" run --rm --platform linux/amd64 -v "$PROJECT_DIR:/build:ro" \
-		"$QUARTUS_IMAGE" bash -c "[[ -f /build/output_files/$PROJECT_REVISION.rbf ]]"; then
-		RBF_OK=1
-	fi
-fi
-if [[ "$RBF_OK" != 1 ]]; then
-	echo "Compilation finished but no RBF was produced: $RBF_FILE" >&2
+	bash -c "export PATH=\"\$PATH:/opt/intelFPGA_lite/17.0/quartus/bin:/intelFPGA_lite/17.0/quartus/bin\" && if ! grep -q '^[[:space:]]*set_global_assignment -name NUM_PARALLEL_PROCESSORS[[:space:]]' '$QSF_NAME'; then echo 'set_global_assignment -name NUM_PARALLEL_PROCESSORS 1' >> '$QSF_NAME'; fi && quartus_sh --flow compile '$QPF_NAME' && cp -f 'output_files/$PROJECT_REVISION.rbf' 'output_files/$STAGED_RBF' && echo \"RBF_MD5: \$(md5sum 'output_files/$STAGED_RBF' | cut -d' ' -f1)\"" \
+	2>&1 | tee "$COMPILE_LOG"; then
+	echo "Compilation failed" >&2
+	rm -f "$COMPILE_LOG"
 	exit 1
 fi
 
-# Stage under the launcher's name so install_to_mister.sh / the support dir
-# stay predictable. Keep the native-named file too (harmless duplicate).
-cp -f "$RBF_FILE" "$PROJECT_DIR/output_files/$STAGED_RBF"
+EXPECTED_MD5="$(sed -n 's/^RBF_MD5: //p' "$COMPILE_LOG" | tail -1)"
+rm -f "$COMPILE_LOG"
+[[ -n "$EXPECTED_MD5" ]] || {
+	echo "Container did not report RBF_MD5 — cannot verify the host-side copy" >&2
+	exit 1
+}
+
+# Poll the host view until the staged rbf matches the container's hash.
+RBF_OK=0
+for _ in $(seq 1 150); do
+	ls "$PROJECT_DIR/output_files/" >/dev/null 2>&1
+	if [[ -f "$PROJECT_DIR/output_files/$STAGED_RBF" ]] \
+		&& [[ "$(md5 -q "$PROJECT_DIR/output_files/$STAGED_RBF" 2>/dev/null)" == "$EXPECTED_MD5" ]]; then
+		RBF_OK=1
+		break
+	fi
+	sleep 4
+done
+if [[ "$RBF_OK" != 1 ]]; then
+	echo "Host view of $STAGED_RBF never matched the container md5" >&2
+	echo "(VirtioFS lag) — expected $EXPECTED_MD5; do NOT deploy until it does" >&2
+	exit 1
+fi
 
 echo "Compiled successfully: $RBF_FILE"
-echo "Staged as: $PROJECT_DIR/output_files/$STAGED_RBF"
+echo "Staged as: $PROJECT_DIR/output_files/$STAGED_RBF (md5 $EXPECTED_MD5)"

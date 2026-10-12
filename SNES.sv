@@ -38,6 +38,7 @@ module emu
 	output [3:0]  M7_SCALE,
     output        HD_PIXEL_VALID,
     output [23:0] HD_PIXEL_IN,
+    output        HD_LINE_ARMED,
 	input         HD_PX_STROBE,
 
 	//Must be passed to hps_io module
@@ -627,12 +628,14 @@ reg [15:0] main_audio_r;
 // Phase 1: Mode 7 register wires (outputs from main, available for hps_ext in Phase 2)
 wire [15:0] m7a_out, m7b_out, m7c_out, m7d_out;
 wire [12:0] m7x_out, m7y_out, m7hofs_out, m7vofs_out;
+wire [7:0]  m7sel_out;
 
 // Phase 2 Task 2.1: HD Mode 7 Line Buffer wires
 wire [8:0]  x_out;
 wire        frame_out;      // PPU BG strobe — NOT a frame boundary (unused, see M7 block)
 wire [23:0] hd_pixel_in;
 wire        hd_px_valid;
+wire        hd_line_armed;
 wire        vblank_out;     // PPU IN_VBL — true vblank level (frame boundary)
 `ifdef M7_2X_ENABLE
 // VRAM resync-dump address mux (drives the vram1/vram2 port-B mux below;
@@ -650,6 +653,7 @@ localparam [3:0] m7_scale_wire = M7_HD_SCALE;
 assign M7_SCALE       = m7_scale_wire;
 assign HD_PIXEL_VALID = hd_px_valid;
 assign HD_PIXEL_IN    = hd_pixel_in;
+assign HD_LINE_ARMED  = hd_line_armed;
 
 // HD scanline buffer (v4, 2-slot row ping-pong, 8bpp + CLUT). Port A
 // (clk_sys) is written by the fetch FSM — always the slot NOT being
@@ -678,7 +682,8 @@ hd_mode7_linebuf linebuf (
     .fetch_en(m7_fetch_en),
     .rd_slot(act),
     .hd_pixel_out(hd_pixel_in),
-    .hd_px_valid(hd_px_valid)
+    .hd_px_valid(hd_px_valid),
+    .hd_line_armed(hd_line_armed)
 );
 `else
 // HD Mode 7 is compiled out so the design fits the 553 M10K block
@@ -687,6 +692,7 @@ hd_mode7_linebuf linebuf (
 assign M7_SCALE       = 4'd1;
 assign HD_PIXEL_VALID = 1'b0;
 assign HD_PIXEL_IN    = 24'd0;
+assign HD_LINE_ARMED  = 1'b0;
 assign hd_pixel_in    = 24'd0;
 assign hd_px_valid    = 1'b0;
 `endif
@@ -823,6 +829,7 @@ main main
 	.M7Y_OUT(m7y_out),
 	.M7HOFS_OUT(m7hofs_out),
 	.M7VOFS_OUT(m7vofs_out),
+	.M7SEL_OUT(m7sel_out),
 
 	// HD pixel ports are unused inside the PPU now (the overlay moved to
 	// sys_top); the inputs stay tied off for port compatibility.
@@ -1710,7 +1717,7 @@ wire [63:0] msu_ram_dout;
 
 `ifdef M7_2X_ENABLE
 // --- Frame timing: IN_VBL rising edge is the true frame boundary ---------
-reg  vbl_d;
+reg  vbl_d;   // driven in the per-line record capture block below
 wire frame_start = vblank_out & ~vbl_d;
 
 // DEBUG (M7_DEBUG_MAILBOX): OR in a free-running ~20 Hz event so the mailbox
@@ -1762,42 +1769,122 @@ wire dump_busy = 1'b0;
 // HD fetch gating — quasi-static (changes at frame granularity at most)
 wire m7_fetch_en = daemon_present;
 
-// --- Per-line M7 register capture + streaming -----------------------------
-// At start_of_scanline of line L the PPU registers hold exactly what line L
-// uses (HDMA applied during the previous line's blanking). The 8 registers
-// are latched and then streamed straight to DDR3 by the service FSM — no
-// BRAM staging. 16-bit entry (L,i) lands at wraddr = M7_REGS_BASE>>1
-// + 8*L + i. ddram.sv's wraddr is a byte address with bit 0 stripped, so
-// the old factor-of-2 address bug is structurally impossible here.
-reg [7:0]  ml_line;
-reg [2:0]  ml_idx;
-reg        ml_run;
-reg [15:0] ml_a, ml_b, ml_c, ml_d;
-reg [12:0] ml_x, ml_y, ml_hofs, ml_vofs;
+// --- Per-line M7 register delta capture (P2c-2) ---------------------------
+// hde fall ends line L's active video; at that edge the PPU registers hold
+// exactly what line L rendered with (the HDMA update for L fired during the
+// previous blanking). Each line is delta-encoded against the last captured
+// line and pushed into the UART stream as a len-prefixed record:
+//
+//   [len][line][mask][lo hi]...      len includes itself
+//   mask bits: 0=A 1=B 2=C 3=D 4=X 5=Y 6=HOFS 7=VOFS
+//
+// Line 0xFE is a per-frame full sync pushed at vblank entry: mask=0xFF, all
+// eight values plus M7SEL appended (len=20). It resynchronises a daemon
+// that joined late or lost a payload, and resets the delta reference on
+// both sides. line 0xFF is reserved.
+reg         rec_hd_d;
+reg         rec_run  = 1'b0;
+reg         sync_pend = 1'b0;
+reg  [4:0]  rec_step;
+reg  [4:0]  rec_len;
+reg  [7:0]  rec_line_b;
+reg  [7:0]  rec_mask_b;
+reg  [8:0]  rec_rm;                 // walking value mask (bit8 = M7SEL)
+reg         rec_wr = 1'b0;          // one-cycle push into m7_reg_stream
+reg  [7:0]  rec_data;
+reg  [7:0]  rec_sel_b;
+reg  [15:0] rc_a, rc_b, rc_c, rc_d; // last captured line's values (reference)
+reg  [12:0] rc_x, rc_y, rc_h, rc_v;
+reg  [7:0]  rec_drops = 8'd0;       // records dropped for FIFO room
 
-wire [31:1] ml_wraddr = M7_REGS_BASE[31:1] + {20'd0, ml_line, ml_idx};
+wire        rec_room;
 
-reg [15:0] ml_payload;
+function [3:0] popcnt8(input [7:0] m);
+    popcnt8 = {3'd0,m[0]} + {3'd0,m[1]} + {3'd0,m[2]} + {3'd0,m[3]}
+            + {3'd0,m[4]} + {3'd0,m[5]} + {3'd0,m[6]} + {3'd0,m[7]};
+endfunction
+
+wire [7:0] cur_mask = {rc_h != m7hofs_out, rc_v != m7vofs_out,
+                       rc_x != m7x_out,      rc_y != m7y_out,
+                       rc_d != m7d_out,      rc_c != m7c_out,
+                       rc_b != m7b_out,      rc_a != m7a_out};
+
+// value byte selected by the walking mask; fields walk lsb-first through
+// mask bits 0..7 (A,B,C,D as lo,hi 16-bit pairs; X,Y,H,VOFS as lo,hi with
+// the 13-bit value right-aligned), then bit8 = M7SEL (single byte)
+reg [7:0] rm_val;
 always @(*) begin
-    case (ml_idx)
-        3'd0: ml_payload = ml_a;
-        3'd1: ml_payload = ml_b;
-        3'd2: ml_payload = ml_c;
-        3'd3: ml_payload = ml_d;
-        3'd4: ml_payload = {3'b000, ml_x};
-        3'd5: ml_payload = {3'b000, ml_y};
-        3'd6: ml_payload = {3'b000, ml_hofs};
-        default: ml_payload = {3'b000, ml_vofs};
+    casez (rec_rm)
+        9'b???????1?: rm_val = rc_a[7:0];
+        9'b??????10?: rm_val = rc_a[15:8];
+        9'b?????100?: rm_val = rc_b[7:0];
+        9'b????1000?: rm_val = rc_b[15:8];
+        9'b???10000?: rm_val = rc_c[7:0];
+        9'b??100000?: rm_val = rc_c[15:8];
+        9'b?1000000?: rm_val = rc_d[7:0];
+        9'b10000000?: rm_val = rc_d[15:8];
+        9'b000000001: rm_val = {3'b000, rc_x[7:0]};
+        9'b000000010: rm_val = {5'b00000, rc_x[12:8]};
+        9'b000000100: rm_val = {3'b000, rc_y[7:0]};
+        9'b000001000: rm_val = {5'b00000, rc_y[12:8]};
+        9'b000010000: rm_val = {3'b000, rc_h[7:0]};
+        9'b000100000: rm_val = {5'b00000, rc_h[12:8]};
+        9'b001000000: rm_val = {3'b000, rc_v[7:0]};
+        9'b010000000: rm_val = {5'b00000, rc_v[12:8]};
+        9'b100000000: rm_val = rec_sel_b;
+        default:      rm_val = 8'h00;
     endcase
 end
 
-// Scanline-start detector: raw H_CNT wrap from end-of-line back to 0.
-reg  start_of_scanline;
-reg  [8:0] ppu_x_prev;
+// Record push sequencer. Pushes are 1 byte/cycle; a line's record finishes
+// long before the next hde fall. If the FIFO runs out of room the record is
+// dropped whole (the next frame's 0xFE full sync repairs the daemon).
+// (vbl_d is driven here since the old shared block was deleted with the
+// ml_* capture; frame_start above samples it.)
 always @(posedge clk_sys) begin
-    ppu_x_prev        <= ppu_x;
-    start_of_scanline <= (ppu_x == 9'd0) && (ppu_x_prev != 9'd0);
-    vbl_d             <= vblank_out;
+    rec_wr   <= 1'b0;
+    rec_hd_d <= HBlank_out;
+    vbl_d    <= vblank_out;
+
+    if (rec_run) begin
+        rec_wr   <= 1'b1;
+        rec_data <= (rec_step == 5'd0) ? rec_len :
+                    (rec_step == 5'd1) ? rec_line_b :
+                    (rec_step == 5'd2) ? rec_mask_b : rm_val;
+        // hi byte of each value pair consumed one walked field
+        rec_rm   <= (rec_step >= 5'd4 && !rec_step[0])
+                    ? (rec_rm & (rec_rm - 9'd1)) : rec_rm;
+        rec_step <= rec_step + 5'd1;
+        if (rec_step == rec_len - 5'd1)
+            rec_run <= 1'b0;
+    end else if (sync_pend || frame_start) begin
+        sync_pend  <= 1'b0;
+        rec_len    <= 5'd20;
+        rec_line_b <= 8'hFE;
+        rec_mask_b <= 8'hFF;
+        rec_rm     <= 9'h1FF;
+        rec_sel_b  <= m7sel_out;
+        rec_run    <= 1'b1;
+        rec_step   <= 5'd0;
+        rc_a <= m7a_out;    rc_b <= m7b_out;
+        rc_c <= m7c_out;    rc_d <= m7d_out;
+        rc_x <= m7x_out;    rc_y <= m7y_out;
+        rc_h <= m7hofs_out; rc_v <= m7vofs_out;
+    end else if (~HBlank_out & rec_hd_d && !vblank_out && (ppu_y < 9'd224)) begin
+        if (cur_mask != 8'd0 && rec_room) begin
+            rec_len    <= 5'd3 + {popcnt8(cur_mask), 1'b0};
+            rec_line_b <= ppu_y[7:0];
+            rec_mask_b <= cur_mask;
+            rec_rm     <= {1'b0, cur_mask};
+            rec_run    <= 1'b1;
+            rec_step   <= 5'd0;
+            rc_a <= m7a_out;    rc_b <= m7b_out;
+            rc_c <= m7c_out;    rc_d <= m7d_out;
+            rc_x <= m7x_out;    rc_y <= m7y_out;
+            rc_h <= m7hofs_out; rc_v <= m7vofs_out;
+        end else if (cur_mask != 8'd0)
+            rec_drops <= rec_drops + 8'd1;
+    end
 end
 
 // --- VRAM write-through FIFO ---------------------------------------------
@@ -1810,42 +1897,17 @@ reg [3:0]  wt_w = 4'd0, wt_r = 4'd0;
 wire [3:0] wt_cnt = wt_w - wt_r;
 
 // ===========================================================================
-// One clk_sys always block owns all M7 engine state: per-line register
-// capture, the frame controller, and the write-through snoop. Single
-// ownership means every register is written from exactly one place.
+// One clk_sys always block owns the frame controller and the write-through
+// snoop. Single ownership means every register is written from exactly one
+// place.
 //
 // PIVOT v2: the 16-bit write service FSM (write-through / per-line mailbox /
 // header / CGRAM / resync-dump writers) is gone with the DDR3 mailbox port.
-// The per-line capture below latches the 8 Mode 7 registers at every
-// scanline start; P2c packs them into the UART stream. The frame controller
-// polls the daemon's ctrl word and adopts published frames.
+// The per-line register capture moved to its own block above (it now feeds
+// the UART record stream). The frame controller polls the daemon's ctrl
+// word and adopts published frames.
 // ===========================================================================
 always @(posedge clk_sys) begin
-    // ---- per-line capture: latch the 8 registers at scanline start ------
-    if (frame_start)
-        ml_line <= 8'd0;
-    else if (start_of_scanline && !ml_run && ml_line < M7_LINE_COUNT[7:0]) begin
-        ml_a    <= m7a_out;
-        ml_b    <= m7b_out;
-        ml_c    <= m7c_out;
-        ml_d    <= m7d_out;
-        ml_x    <= m7x_out;
-        ml_y    <= m7y_out;
-        ml_hofs <= m7hofs_out;
-        ml_vofs <= m7vofs_out;
-        ml_idx  <= 3'd0;
-        ml_run  <= 1'b1;
-    end
-    // Capture drain (one word/cycle — the whole 8-reg set fits in a
-    // fraction of a scanline; the v1 FSM advanced it via MB_ML writes).
-    else if (ml_run) begin
-        if (ml_idx == 3'd7) begin
-            ml_run  <= 1'b0;
-            ml_line <= ml_line + 8'd1;
-        end else
-            ml_idx <= ml_idx + 3'd1;
-    end
-
     // ---- frame controller ------------------------------------------------
     ctrl_done_s1 <= ctrl_done;
     ctrl_done_s2 <= ctrl_done_s1;
@@ -2403,10 +2465,11 @@ assign dbg_bytes[495:480] = last_ready_seq;           // [60..61]
 assign dbg_bytes[1031:1024] = disp_row;               // [128] displayed row
 assign dbg_bytes[1039:1032] = last_row_id;            // [129] inactive-slot row
 assign dbg_bytes[1047:1040] = {row_adv, act, 6'b0};   // [130] swap activity
+assign dbg_bytes[1055:1048] = rec_drops;              // [131] records dropped (room)
 assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
 assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
 assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
-assign dbg_bytes[2047:1048] = {125{32'hAAAA_AAAA}};   // filler (bytes 131..255)
+assign dbg_bytes[2047:1056] = {124{32'hAAAA_AAAA}};   // filler (bytes 132..255)
 
 wire m7_stream_txd;
 m7_reg_stream #(
@@ -2416,8 +2479,11 @@ m7_reg_stream #(
 ) m7_reg_stream (
 	.clk       (clk_sys),
 	.rst       (~RESET_N),
-	.test_mode (2'd2),
+	.test_mode (2'd3),          // per-line records + interleaved telemetry
 	.dbg_bytes (dbg_bytes),
+	.rec_wr    (rec_wr),
+	.rec_data  (rec_data),
+	.rec_room  (rec_room),
 	.txd       (m7_stream_txd)
 );
 assign m7_dbg_tx = m7_stream_txd;

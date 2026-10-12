@@ -55,6 +55,19 @@
 // Bits [31:19] reserved-zero; the FPGA adopts only words with those clear
 // and FMT8 set.
 
+// --- Per-line record stream (UART payload type != 0xC3, P2c-2) ---
+// Record: [len][line][mask][lo hi]... len includes itself.
+// mask selects which changed fields follow, lsb-first.
+#define M7_RECF_A    0  // int16
+#define M7_RECF_B    1  // int16
+#define M7_RECF_C    2  // int16
+#define M7_RECF_D    3  // int16
+#define M7_RECF_X    4  // 13-bit (zero-extended to 16)
+#define M7_RECF_Y    5  // 13-bit
+#define M7_RECF_HOFS 6  // 13-bit
+#define M7_RECF_VOFS 7  // 13-bit
+#define M7_RECLINE_SYNC 0xFEu // full sync: mask FF + M7SEL tail
+
 // VRAM image size: 32768 words (one 16-bit slot per VRAM byte).
 #define M7_VRAM_WORDS 32768u
 

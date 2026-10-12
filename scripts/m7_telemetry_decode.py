@@ -72,7 +72,23 @@ def ranges(bits):
     return out
 
 def show(seq, p, label):
-    if p[HEAD] != 0xC3 or p[TAIL] != 0x5A:
+    if p[HEAD] != 0xC3:
+        # mode 3 record payload: len-prefixed per-line register records
+        recs, i, n = [], 0, len(p)
+        while i < n:
+            ln = p[i]
+            if ln < 3 or i + ln > n:
+                break
+            recs.append((p[i + 1], p[i + 2], ln))
+            i += ln
+            if ln == 0:
+                break
+        full = sum(1 for ln_, m_, _ in recs if ln_ == 0xFE)
+        lines = sum(1 for ln_, m_, _ in recs if ln_ != 0xFE)
+        print(f"  [{label}] RECORD payload: records={len(recs)} "
+              f"(sync={full} lines={lines}), first={recs[:4]}")
+        return
+    if p[TAIL] != 0x5A:
         print(f"  [{label}] BAD MAGIC head={p[HEAD]:02X} tail={p[TAIL]:02X}")
         return
     f = p[FLAGS]
@@ -100,7 +116,8 @@ def show(seq, p, label):
     print(f"    fetch: row={u16(FETCH_ROW)} word={p[FETCH_WORD]} "
           f"ppu=({u16(PPU_X)},{u16(PPU_Y)}) ddram_state={p[DDR_STATE]&3}")
     print(f"    swap: disp_row={p[DISP_ROW]} last_row={p[LAST_ROW]} "
-          f"row_adv={(p[SWAP]>>7)&1} act={(p[SWAP]>>6)&1}")
+          f"row_adv={(p[SWAP]>>7)&1} act={(p[SWAP]>>6)&1} "
+          f"rec_drops={p[131]}")
     print(f"    ctrl_read=0x{u32(CTRL_DATA):08X} (expect 0x00020001 = seq1|buf0|FMT8) "
           f"last_seq_adopted={u16(LAST_SEQ):04X} dm_word_lo=0x{u32(DM_WORD):08X}")
 

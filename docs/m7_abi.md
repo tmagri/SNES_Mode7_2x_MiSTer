@@ -208,3 +208,58 @@ identical palette is harmless.
   (`R8 = {R5, R5[4:2]}` etc.).
 - Fixed 4× scale: native index = `rd_x[9:2]` — every native pixel consumes
   **4 HD pixel strobes** (the display-side expansion contract).
+
+---
+
+# REVISION v4 — per-line register records on the UART stream (2026-10-13, P2c-2)
+
+The FPGA→ARM direction now carries live Mode 7 state alongside telemetry.
+Every payload slot on the ttyS1 stream (3 Mbaud, framing unchanged:
+`A5 5C seq len payload crc8`) is discriminated by `payload[0]`:
+
+| `payload[0]` | Content |
+|---|---|
+| `0xC3` | telemetry snapshot (same byte map as before; byte 131 = record drop count) |
+| anything else | a slice of the record byte stream |
+
+## Record byte stream
+
+Each record is `len`-prefixed, len counting itself:
+
+```
+[len][line][mask][lo hi]...
+```
+
+- `line` 0..223: the display line whose values these are. `0xFE` is a
+  per-frame **full sync** (`mask=0xFF`, all eight values + M7SEL appended,
+  len=20) pushed at vblank entry; `0xFF` reserved.
+- `mask` bit i set ⇒ a 16-bit little-endian value follows for field i,
+  lsb-first order: `A, B, C, D, X, Y, HOFS, VOFS` (constants
+  `M7_RECF_*` in both ABI headers). A–D are the raw int16 register values;
+  X/Y/HOFS/VOFS are 13-bit, zero-extended.
+- The mask is a **delta against the previously captured line** (the
+  reference chain), so an unchanged field is simply absent. A line whose
+  registers didn't change at all sends nothing.
+- Records may straddle two payloads (or a telemetry payload); the receiver
+  carries the partial record. Padding after the last record in a payload is
+  `0x00`; a mid-record pad is impossible by construction.
+- A CRC-failed payload may swallow record bytes: the receiver must discard
+  per-line state and resync at the next `0xFE` full sync (~16.7 ms later).
+
+The FPGA captures each line at its hde fall — the instant the registers
+hold exactly what that line rendered with — and pushes at most one record
+per line; the worst-case game demand (all four matrix regs changing every
+line, 60 fps) is ~134 KB/s against ~207 KB/s of record capacity (15 of
+every 16 payload slots; slots with an empty record FIFO are skipped, which
+keeps the link quiet when nothing changes).
+
+## Receiver contract (daemon, P2c-2)
+
+- Maintain the delta chain: on `0xFE` load all eight values + M7SEL into
+  the chain; on a line record, apply each masked field into the chain and
+  store the chain as that line's values.
+- On daemon start (or after a CRC loss) per-line values are unreliable
+  until each line's first record after the next full sync.
+- Debug visualization (current build): each display line paints `A[7:0]`
+  as the left-half CLUT index and `D[7:0]` as the right half — the HDMA
+  perspective table appears as per-line colour bands.

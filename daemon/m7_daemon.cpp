@@ -173,13 +173,13 @@ class M7Daemon {
   }
 
   void Run() {
-    std::cout << "P2c-1 test-card mode (8bpp CLUT indices)" << std::endl;
+    std::cout << "P2c-2 reg-stream mode (per-line records + debug viz)"
+              << std::endl;
 
-    // Fill both buffers with the static card, publish buffer 0. With
-    // M7_STATIC the card never changes and the FPGA fetch loop reads the
-    // same buffer forever (display-path proof). Otherwise each tick fills
-    // the INACTIVE buffer and flips READY_BUF — the FPGA adopts whole
-    // frames, so a repaint can never tear mid-frame.
+    // Show the static test card until the first vblank sync record arrives,
+    // then repaint from the per-line register shadow at every frame
+    // boundary the FPGA reports. With M7_STATIC the first sync publishes
+    // one shadow frame and nothing further changes.
     FillCard(0, 0);
     FillCard(1, 0);
     cur_pub_ = 0;
@@ -188,13 +188,26 @@ class M7Daemon {
     std::cout << "ctrl published (ready_seq=1, READY_BUF=0, FMT8) — FPGA "
                  "should start fetching" << std::endl;
 
-    uint64_t anim_last = 0;
-    uint64_t log_last  = now_ns();
-    uint32_t phase = 0;
+    uint64_t log_last = now_ns();
     uint32_t log_mark = 0;
+    uint32_t last_syncs = 0;
+    bool published_viz = false;
 
     while (true) {
-      const uint32_t got = PumpStream();
+      PumpStream();
+
+      // Frame boundary: the sync (line 0xFE) arrives after the whole
+      // frame's records, so the shadow is complete — repaint the inactive
+      // buffer and flip.
+      if (syncs_ != last_syncs && shadow_synced_) {
+        last_syncs = syncs_;
+        if (!static_card_ || !published_viz) {
+          cur_pub_ ^= 1u;
+          FillRegViz(cur_pub_);
+          *ctrl_ = CtrlWord(++ready_seq_, cur_pub_);
+          published_viz = true;
+        }
+      }
 
       const uint64_t now = now_ns();
       if (now - log_last >= 5000000000ull) {
@@ -202,19 +215,13 @@ class M7Daemon {
         std::cout << "stream: " << frames_valid_ << " valid frames ("
                   << (frames_valid_ - log_mark) / 5 << "/s), "
                   << parser_.resyncs() << " resyncs, "
-                  << parser_.crc_bad() << " crc_bad" << std::endl;
+                  << parser_.crc_bad() << " crc_bad | syncs=" << syncs_
+                  << " lines=" << rec_lines_ << " sel=0x"
+                  << std::hex << static_cast<int>(m7sel_) << std::dec
+                  << " drops=" << static_cast<int>(tel_drops_) << std::endl;
         log_mark = frames_valid_;
       }
-      if (got == 0) sleep_ns(20000000ull);  // nothing pending: 20 ms idle
-
-      // M7_STATIC=1 freezes the card after the initial fill.
-      if (!static_card_ && now - anim_last >= 200000000ull) {  // ~5 fps flip
-        anim_last = now;
-        phase = (phase + 1) & 0x1Fu;
-        cur_pub_ ^= 1u;
-        FillCard(cur_pub_, phase);
-        *ctrl_ = CtrlWord(++ready_seq_, cur_pub_);
-      }
+      sleep_ns(2000000ull);  // 2 ms poll; syncs arrive at 60 Hz
     }
   }
 
@@ -268,8 +275,9 @@ class M7Daemon {
     return 0;
   }
 
-  // Drains whatever the UART has into the parser; returns how many new
-  // CRC-valid frames came out, and tracks sequence continuity.
+  // Drains whatever the UART has into the parser. CRC-valid frames are
+  // classified by payload[0]: 0xC3 = telemetry (drops counter only), else a
+  // slice of the per-line record byte stream.
   uint32_t PumpStream() {
     uint8_t buf[4096];
     const int n = read(stream_fd_, buf, sizeof(buf));
@@ -284,6 +292,15 @@ class M7Daemon {
         ++slips_;
       expect_seq_ = fr.seq;
       have_seq_ = true;
+      if (fr.len >= 132 && fr.payload[0] == 0xC3) {
+        tel_drops_ = fr.payload[131];
+      } else {
+        ProcessRecordPayload(fr.payload, static_cast<int>(fr.len));
+      }
+    }
+    if (parser_.crc_bad() != crc_bad_seen_) {
+      crc_bad_seen_ = parser_.crc_bad();
+      pending_invalidate_ = true;  // a record payload may be lost
     }
     return got;
   }
@@ -311,6 +328,134 @@ class M7Daemon {
       for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x) {
         row[x] = static_cast<uint8_t>(base + (x / 8));
       }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Per-line register record stream (P2c-2).
+  //
+  // Record payloads are a byte stream of len-prefixed records:
+  //   [len][line][mask][lo hi]...   len includes itself
+  //   mask bits: 0=A 1=B 2=C 3=D 4=X 5=Y 6=HOFS 7=VOFS
+  // A record may straddle two payloads (or a telemetry payload); carry_
+  // bridges the split. Line 0xFE is the per-frame full sync (mask=0xFF,
+  // 8 values + M7SEL tail): it resets the delta chain on both sides. A
+  // CRC-failed payload invalidates per-line values until the next sync.
+  // ------------------------------------------------------------------
+  static const int kRecMax = 32;
+
+  static uint16_t le16(const uint8_t *p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+  }
+
+  static void SetChainField(M7Regs &r, int field, uint16_t v) {
+    switch (field) {
+      case 0: r.a = static_cast<int16_t>(v); break;
+      case 1: r.b = static_cast<int16_t>(v); break;
+      case 2: r.c = static_cast<int16_t>(v); break;
+      case 3: r.d = static_cast<int16_t>(v); break;
+      case 4: r.x = v & 0x1FFF; break;
+      case 5: r.y = v & 0x1FFF; break;
+      case 6: r.hofs = v & 0x1FFF; break;
+      case 7: r.vofs = v & 0x1FFF; break;
+      default: break;
+    }
+  }
+
+  void ProcessRecordPayload(const uint8_t *p, int n) {
+    for (int i = 0; i < n; ++i) {
+      if (carry_len_ > 0) {
+        // A pad 0x00 can only appear when the record stream is exhausted;
+        // a lone pending len byte followed by pads means the record never
+        // continued — drop it. (Mid-record pads are impossible: the FPGA
+        // pads only when its record FIFO is fully drained.)
+        if (carry_len_ == 1 && p[i] == 0x00) {
+          carry_len_ = 0;
+          continue;
+        }
+        carry_[carry_len_++] = p[i];
+        if (carry_len_ >= carry_[0]) {
+          ApplyRecord(carry_, carry_[0]);
+          carry_len_ = 0;
+        }
+      } else {
+        const int len = p[i];
+        if (len < 3 || len > kRecMax) continue;  // padding / garbage byte
+        carry_[0] = static_cast<uint8_t>(len);
+        carry_len_ = 1;
+      }
+    }
+  }
+
+  void ApplyRecord(const uint8_t *r, int len) {
+    const uint8_t line = r[1];
+    const uint8_t mask = r[2];
+    if (line == 0xFF) return;  // reserved
+
+    if (line == 0xFE) {
+      // Full sync: [20][FE][FF][A B C D X Y H V][SEL]
+      if (len < 20) return;
+      chain_.a    = static_cast<int16_t>(le16(r + 3));
+      chain_.b    = static_cast<int16_t>(le16(r + 5));
+      chain_.c    = static_cast<int16_t>(le16(r + 7));
+      chain_.d    = static_cast<int16_t>(le16(r + 9));
+      chain_.x    = le16(r + 11) & 0x1FFF;
+      chain_.y    = le16(r + 13) & 0x1FFF;
+      chain_.hofs = le16(r + 15) & 0x1FFF;
+      chain_.vofs = le16(r + 17) & 0x1FFF;
+      m7sel_ = r[19];
+      if (pending_invalidate_) {
+        memset(line_ok_, 0, sizeof(line_ok_));
+        pending_invalidate_ = false;
+      }
+      shadow_synced_ = true;
+      ++syncs_;
+      return;
+    }
+
+    if (!shadow_synced_) return;
+    int off = 3;
+    for (int f = 0; f < 8 && off + 1 < len; ++f) {
+      if (mask & (1 << f)) {
+        SetChainField(chain_, f, le16(r + off));
+        off += 2;
+      }
+    }
+    if (line < M7_LINE_COUNT) {
+      shadow_[line] = chain_;
+      line_ok_[line] = true;
+      ++rec_lines_;
+    }
+  }
+
+  // Debug visualization: paint per-line register bytes as CLUT indices.
+  // Left half of each line = M7A[7:0], right half = M7D[7:0] — the HDMA
+  // perspective table shows as per-line colour bands that move every line
+  // while the game tilts. Lines never covered by a record stay at index 0.
+  //
+  // M7_TESTPAT=1 switches to a sawtooth probe: index = x within the row,
+  // xored with y so consecutive lines differ. Any displayed pixel that is
+  // NOT pattern(x,y) is leaked from elsewhere in the pipeline (native
+  // mux, stale slot, phase slip) and is immediately identifiable.
+  bool testpat_ = getenv("M7_TESTPAT") != nullptr;
+
+  void FillRegViz(uint32_t slot) {
+    volatile uint8_t *buf = reinterpret_cast<volatile uint8_t *>(pix_[slot]);
+    for (int y = 0; y < static_cast<int>(M7_LINE_COUNT); ++y) {
+      volatile uint8_t *row = buf + y * M7_PIX_STRIDE;
+      if (testpat_) {
+        for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
+          row[x] = static_cast<uint8_t>(x ^ y);
+        continue;
+      }
+      const uint8_t al = line_ok_[y]
+                             ? static_cast<uint8_t>(shadow_[y].a & 0xFF)
+                             : static_cast<uint8_t>(0);
+      const uint8_t dl = line_ok_[y]
+                             ? static_cast<uint8_t>(shadow_[y].d & 0xFF)
+                             : static_cast<uint8_t>(0);
+      for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
+        row[x] = (x < static_cast<int>(M7_PIX_STRIDE) / 2) ? al : dl;
     }
   }
 
@@ -412,6 +557,21 @@ class M7Daemon {
   uint16_t last_seq_ = 0;
   uint16_t expect_seq_ = 0;
   bool have_seq_ = false;
+
+  // Per-line register shadow (P2c-2): chain_ mirrors the FPGA's delta
+  // reference, shadow_[line] is the last known value for that display line.
+  M7Regs chain_ = {};
+  M7Regs shadow_[M7_LINE_COUNT] = {};
+  bool line_ok_[M7_LINE_COUNT] = {};
+  bool shadow_synced_ = false;
+  bool pending_invalidate_ = false;
+  uint8_t carry_[kRecMax] = {};
+  int carry_len_ = 0;
+  uint8_t m7sel_ = 0;
+  uint8_t tel_drops_ = 0;
+  uint32_t crc_bad_seen_ = 0;
+  uint32_t syncs_ = 0;
+  uint32_t rec_lines_ = 0;
 };
 
 int main(int argc, char *argv[]) {

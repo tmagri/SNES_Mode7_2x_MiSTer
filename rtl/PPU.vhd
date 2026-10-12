@@ -78,6 +78,7 @@ entity SPPU is
 		M7Y_OUT			: out std_logic_vector(12 downto 0);
 		M7HOFS_OUT		: out std_logic_vector(12 downto 0);
 		M7VOFS_OUT		: out std_logic_vector(12 downto 0);
+		M7SEL_OUT		: out std_logic_vector(7 downto 0);
 
 		-- Phase 1 Task 1.2: HD pixel mux inputs (ARM-generated high-res scanline pixels)
 		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);	-- 24-bit RGB from ARM
@@ -2800,6 +2801,7 @@ M7X_OUT    <= M7X;
 M7Y_OUT    <= M7Y;
 M7HOFS_OUT <= M7HOFS;
 M7VOFS_OUT <= M7VOFS;
+M7SEL_OUT  <= M7SEL;
 
 HIGH_RES <= HIRES or (PSEUDOHIRES and not BLEND)
 				or (M7_HD and not HIRES and not PSEUDOHIRES

@@ -61,6 +61,7 @@ module hd_mode7_linebuf
     input             hde_in,         // active-high display enable
     input             line_hd_in,     // this line's row was fetched (clk_sys)
     input             px_strobe,      // emit the next pixel (clk_vid)
+    output            hd_line_armed,  // line-level HD enable (clk_vid, level)
     input             fetch_en,       // quasi-static: HD fetch path active
 
     input             rd_slot,        // slot to display (changes at hde falls)
@@ -159,5 +160,6 @@ module hd_mode7_linebuf
     end
 
     assign hd_pixel_out = bgr555_to_888(rd_rgb);
+    assign hd_line_armed = armed;
 
 endmodule

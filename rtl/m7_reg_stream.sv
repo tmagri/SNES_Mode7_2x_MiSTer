@@ -22,6 +22,19 @@
 // shape of the future per-line register stream (P2c) — same framing, real
 // content.
 //
+// Production mix (test_mode=3, P2c-2): the payload slots carry the parent's
+// per-line record stream, with telemetry interleaved so debug visibility
+// survives. Payload[0] discriminates: 0xC3 = telemetry snapshot (same
+// layout as mode 2), anything else = a slice of the record byte stream.
+// Records are len-prefixed ([len][line][mask][values...], len includes
+// itself), pushed whole by the parent; a record may straddle two payloads
+// (the receiver carries the partial) and a CRC-failed payload invalidates
+// the stream until the next line-0xFE full sync at the next vblank.
+// Wire budget at 3 Mbaud: payload opportunities ~1100/s; every 16th is
+// telemetry, the rest carry records only when the FIFO is non-empty
+// (idle slots are skipped, keeping the link quiet). 15/16 * 256 B * 1100/s
+// ~ 264 KB/s of record bandwidth vs the 134 KB/s worst-case game demand.
+//
 // Frame (little-endian):
 //   A5 5C seq_l seq_h len_l len_h payload[0..len-1] crc8
 //   test-mode payload[i] = (seq + i) ^ A7  (self-describing: detects slips
@@ -40,8 +53,11 @@ module m7_reg_stream #(
 )(
 	input        clk,
 	input        rst,          // synchronous, active high (~RESET_N)
-	input  [1:0] test_mode,    // 0=off 1=pattern 2=telemetry snapshot
+	input  [1:0] test_mode,    // 0=off 1=pattern 2=telemetry 3=records+telemetry
 	input [255:0][7:0] dbg_bytes, // telemetry payload (sampled per frame)
+	input        rec_wr,       // record byte push (whole records, in order)
+	input  [7:0] rec_data,
+	output       rec_room,     // 1 = space for another record; drop when 0
 	output reg   txd = 1'b1
 );
 
@@ -67,6 +83,25 @@ module m7_reg_stream #(
 	wire       fifo_empty = (fifo_wr == fifo_rd);
 
 	// ------------------------------------------------------------------
+	// Record FIFO (P2c-2): the parent pushes len-prefixed records whole.
+	// 512 B absorbs >3 lines of worst-case records between payload slots.
+	// Same clk domain as the parent (clk_sys), 1 byte/cycle in, drained
+	// 1 byte/cycle by the payload assembler.
+	// ------------------------------------------------------------------
+	reg [7:0]  rec_mem [0:511];
+	reg [9:0]  rec_w = 10'd0, rec_r = 10'd0;
+	wire [10:0] rec_cnt = rec_w - rec_r;
+	assign rec_room = (rec_cnt < 11'd492);
+	wire       rec_avail = (rec_r != rec_w);
+
+	always @(posedge clk) begin
+		if (rec_wr) begin
+			rec_mem[rec_w[8:0]] <= rec_data;
+			rec_w <= rec_w + 10'd1;
+		end
+	end
+
+	// ------------------------------------------------------------------
 	// Frame generator: one byte emitted per state entry, push + CRC step
 	// in the same clocked branch (no cross-block tangles).
 	// ------------------------------------------------------------------
@@ -76,18 +111,21 @@ module m7_reg_stream #(
 	reg  [7:0]  g_crc   = 8'd0;
 	reg  [15:0] g_idx   = 16'd0;
 	reg  [15:0] g_gap   = 16'd0;
+	reg  [3:0]  slot_cnt = 4'd0;  // payload opportunities, mod 16 (mode 3)
 
 	wire [7:0] hdr_byte = (g_idx == 0) ? g_seq[7:0] :
 	                      (g_idx == 1) ? g_seq[15:8] :
 	                      (g_idx == 2) ? PAYLOAD_LEN[7:0] :
 	                                     PAYLOAD_LEN[15:8];
-	// Payload source: pattern (BER self-test) or the latched telemetry
-	// snapshot. dbg_shadow is taken at the sync bytes so one frame's bytes
-	// all belong to the same instant.
+	// Payload source: pattern (BER self-test), the latched telemetry
+	// snapshot, or the record byte stream. dbg_shadow is taken at the sync
+	// bytes so one frame's bytes all belong to the same instant.
 	reg [255:0][7:0] dbg_shadow;
-	wire [7:0] pay_byte = (test_mode == 2'd2) ? dbg_shadow[g_idx[7:0]] :
-	                      (test_mode == 2'd1) ? ((g_seq[7:0] + g_idx[7:0]) ^ 8'hA7) :
-	                      8'h00;
+	reg        is_tel = 1'b1;   // this payload is telemetry (mode 3 only)
+	wire [7:0] rec_byte_q = rec_mem[rec_r[8:0]];
+	wire [7:0] pay_byte = (test_mode == 2'd1) ? ((g_seq[7:0] + g_idx[7:0]) ^ 8'hA7) :
+	                      (test_mode == 2'd2 || is_tel) ? dbg_shadow[g_idx[7:0]] :
+	                      rec_avail ? rec_byte_q : 8'h00;
 
 	function [7:0] crc8_next(input [7:0] c, input [7:0] b);
 		reg [7:0] x;
@@ -104,10 +142,21 @@ module m7_reg_stream #(
 			g_seq   <= 16'd0;
 		end else begin
 			case (g_state)
-				// idle gap (~64 baud bits) between frames lets the checker resync
+				// idle gap (~64 baud bits) between frames lets the checker
+				// resync. In mode 3 a non-telemetry slot with an empty
+				// record FIFO is skipped: the slot counter still advances
+				// so telemetry keeps its 1-in-16 cadence, but the link
+				// stays quiet while no records are pending.
 				G_GAP: if (test_mode != 2'd0 && &g_gap[5:0] && !fifo_full) begin
-					g_gap   <= 16'd0;
-					g_state <= G_SYNC1;
+					if (test_mode == 2'd3 && slot_cnt[3:0] != 4'h0 && !rec_avail) begin
+						g_gap    <= 16'd0;
+						slot_cnt <= slot_cnt + 4'd1;
+					end else begin
+						g_gap    <= 16'd0;
+						g_state  <= G_SYNC1;
+						slot_cnt <= slot_cnt + 4'd1;
+						is_tel   <= (test_mode != 2'd3) || (slot_cnt[3:0] == 4'h0);
+					end
 				end else if (nco_tick)
 					g_gap <= g_gap + 16'd1;
 
@@ -142,6 +191,9 @@ module m7_reg_stream #(
 					fifo_wr       <= fifo_wr + 4'd1;
 					g_crc         <= crc8_next(g_crc, pay_byte);
 					g_idx         <= g_idx + 16'd1;
+					// consume the record byte that pay_byte exposed
+					if (test_mode == 2'd3 && !is_tel && rec_avail)
+						rec_r <= rec_r + 10'd1;
 					if (g_idx == PAYLOAD_LEN - 16'd1) begin
 						g_idx   <= 16'd0;
 						g_state <= G_CRC;

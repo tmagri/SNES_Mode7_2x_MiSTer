@@ -119,6 +119,7 @@ module main (
 	output     [12:0] M7Y_OUT,
 	output     [12:0] M7HOFS_OUT,
 	output     [12:0] M7VOFS_OUT,
+	output     [7:0]  M7SEL_OUT,
 
 	// True vblank level from the PPU (VBLANKn is delayed/gated elsewhere).
 	// The M7 frame controller uses its rising edge as the frame boundary.
@@ -328,6 +329,7 @@ SNES SNES
 	.m7y_out(M7Y_OUT),
 	.m7hofs_out(M7HOFS_OUT),
 	.m7vofs_out(M7VOFS_OUT),
+	.m7sel_out(M7SEL_OUT),
 
 	// Phase 1: HD pixel mux inputs (tied off; Phase 2 will drive these from the line buffer)
 	.hd_pixel_in(HD_PIXEL_IN),

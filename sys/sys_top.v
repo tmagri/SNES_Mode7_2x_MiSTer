@@ -1389,6 +1389,7 @@ reg        final_ce_pixel;
 wire [3:0]  m7_scale;
 wire        hd_px_valid;
 wire [23:0] hd_pixel_in;
+wire        hd_line_armed;
 
 // One strobe per scaled output pixel. The linebuf registers hd_px_valid +
 // hd_pixel_in so they land the cycle AFTER the strobe (a BRAM read takes
@@ -1428,9 +1429,15 @@ always @(posedge clk_vid) begin
 	// MULTIPLEXER: HD Mode 7 Buffer OR Native SNES Pixel.
 	// hd_px_valid (not a static enable) gates each pixel individually,
 	// so an unfetched/disabled line falls back to the native pixel.
+	// v3.2: on an ARMED line the native branch never fires — the daemon's
+	// render replaces the whole Mode 7 line, so any native pixel that
+	// slips through the valid/strobe phase offset is a visible defect
+	// (measured on device: 1 native pixel per 4-px group = fine vertical
+	// striping). Non-valid cycles on armed lines hold the last HD pixel;
+	// only genuinely disarmed lines fall back to native.
 	if (hd_px_valid) begin
 		final_rgb_out <= hd_pixel_in;
-	end else if (~ce_d) begin
+	end else if (~ce_d && !hd_line_armed) begin
 		final_rgb_out <= snes_rgb_out;
 	end
 end
@@ -1819,6 +1826,7 @@ emu emu
 	.M7_SCALE(m7_scale),
     .HD_PIXEL_VALID(hd_px_valid),
     .HD_PIXEL_IN(hd_pixel_in),
+    .HD_LINE_ARMED(hd_line_armed),
     .HD_PX_STROBE(HD_PX_STROBE),
 	.HPS_BUS({fb_en, sl, f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,

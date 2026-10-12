@@ -18,3 +18,6 @@ daemon/*.o
 __pycache__/
 daemon/test_uart_parser
 c5_pin_model_dump.txt
+
+# Staged bitstream (built by snes_build.sh, never tracked)
+SNES_Mode7_HD.rbf

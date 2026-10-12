@@ -59,6 +59,19 @@ localparam [4:0] M7_CTRL_DUMP_REQ  = 18;  // daemon requests a VRAM resync dump
 // Bits [31:19] reserved-zero. The FPGA adopts only words with the reserved
 // bits clear AND FMT8 set (rejects boot garbage + stale 16bpp publishers).
 
+// --- Per-line record stream (UART payload type != 0xC3, P2c-2) ---
+// Record: [len][line][mask][lo hi]... len includes itself.
+// mask selects which changed fields follow, lsb-first.
+localparam [2:0] M7_RECF_A    = 0;  // int16
+localparam [2:0] M7_RECF_B    = 1;  // int16
+localparam [2:0] M7_RECF_C    = 2;  // int16
+localparam [2:0] M7_RECF_D    = 3;  // int16
+localparam [2:0] M7_RECF_X    = 4;  // 13-bit (zero-extended to 16)
+localparam [2:0] M7_RECF_Y    = 5;  // 13-bit
+localparam [2:0] M7_RECF_HOFS = 6;  // 13-bit
+localparam [2:0] M7_RECF_VOFS = 7;  // 13-bit
+localparam [7:0] M7_RECLINE_SYNC = 8'hFE; // full sync: mask FF + M7SEL tail
+
 // --- 64-bit read-port word addresses (physical byte >> 3) ---
 localparam [28:0] M7_CTRL_WORD     = 29'h07C00200;  // M7_CTRL_BASE     >> 3
 localparam [28:0] M7_PIXBUF_WORD   = 29'h07C00400;  // M7_PIXBUF_BASE   >> 3

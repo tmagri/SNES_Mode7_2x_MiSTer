@@ -128,6 +128,7 @@ entity SNES is
 		M7Y_OUT			: out std_logic_vector(12 downto 0);
 		M7HOFS_OUT		: out std_logic_vector(12 downto 0);
 		M7VOFS_OUT		: out std_logic_vector(12 downto 0);
+		M7SEL_OUT		: out std_logic_vector(7 downto 0);
 
 		-- Phase 1: HD pixel mux inputs (ARM-generated HD Mode 7 scanline pixels)
 		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);
@@ -406,6 +407,7 @@ begin
 		M7Y_OUT			=>	M7Y_OUT,
 		M7HOFS_OUT		=>	M7HOFS_OUT,
 		M7VOFS_OUT		=>	M7VOFS_OUT,
+		M7SEL_OUT		=>	M7SEL_OUT,
 
 		-- Phase 1 Task 1.2: HD pixel mux inputs
 		HD_PIXEL_IN		=>	HD_PIXEL_IN,
