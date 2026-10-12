@@ -173,18 +173,20 @@ class M7Daemon {
   }
 
   void Run() {
-    std::cout << "P2b test-card mode" << std::endl;
+    std::cout << "P2c-1 test-card mode (8bpp CLUT indices)" << std::endl;
 
-    // Fill both buffers with the static card, publish buffer 0 exactly ONCE
-    // and never flip: the FPGA's continuous fetch loop reads the same buffer
-    // forever. The animated repaint lands in the live buffer, so mid-write
-    // tearing is expected and harmless on a test card (real ping-pong and
-    // the flip handshake return in P2c with the register stream).
-    FillCard(pix_[0], 0);
-    FillCard(pix_[1], 0);
-    *ctrl_ = (1u & 0xFFFFu) | (0u << M7_CTRL_READY_BUF);
-    std::cout << "ctrl published (ready_seq=1, READY_BUF=0) — FPGA should "
-                 "start fetching" << std::endl;
+    // Fill both buffers with the static card, publish buffer 0. With
+    // M7_STATIC the card never changes and the FPGA fetch loop reads the
+    // same buffer forever (display-path proof). Otherwise each tick fills
+    // the INACTIVE buffer and flips READY_BUF — the FPGA adopts whole
+    // frames, so a repaint can never tear mid-frame.
+    FillCard(0, 0);
+    FillCard(1, 0);
+    cur_pub_ = 0;
+    ready_seq_ = 1;
+    *ctrl_ = CtrlWord(ready_seq_, cur_pub_);
+    std::cout << "ctrl published (ready_seq=1, READY_BUF=0, FMT8) — FPGA "
+                 "should start fetching" << std::endl;
 
     uint64_t anim_last = 0;
     uint64_t log_last  = now_ns();
@@ -205,16 +207,24 @@ class M7Daemon {
       }
       if (got == 0) sleep_ns(20000000ull);  // nothing pending: 20 ms idle
 
-      // M7_STATIC=1 freezes the card after the initial fill — display-path
-      // proof: with no mid-frame repaint tearing the screen must hold a
-      // perfectly stable (if vertically folded) pattern.
-      if (!static_card_ && now - anim_last >= 200000000ull) {  // ~5 fps repaint
+      // M7_STATIC=1 freezes the card after the initial fill.
+      if (!static_card_ && now - anim_last >= 200000000ull) {  // ~5 fps flip
         anim_last = now;
         phase = (phase + 1) & 0x1Fu;
-        FillCard(pix_[0], phase);
+        cur_pub_ ^= 1u;
+        FillCard(cur_pub_, phase);
+        *ctrl_ = CtrlWord(++ready_seq_, cur_pub_);
       }
     }
   }
+
+ private:
+  // Ctrl word v2: ready_seq | buffer << 16 | FMT8 (bit 17, required).
+  static uint32_t CtrlWord(uint32_t seq, uint32_t buf) {
+    return (seq & 0xFFFFu) | (buf << M7_CTRL_READY_BUF) |
+           (1u << M7_CTRL_FMT8);
+  }
+
 
  private:
   // M7_STATIC=1 freezes the card after the initial fill (display-path proof)
@@ -289,15 +299,17 @@ class M7Daemon {
     return true;
   }
 
-  // Animated diagonal sweep, RGB565, 8-px bands — coarse enough that Mode 7
-  // scaling distortion (shear/squeeze/row drops) is obvious at a glance.
-  void FillCard(volatile uint16_t *buf, uint32_t phase) {
+  // Test card: one CLUT index byte per native pixel, 8-px diagonal bands
+  // cycling through the full 256-entry palette — coarse enough that Mode 7
+  // scaling distortion (shear/squeeze/row drops) is obvious at a glance,
+  // and every band colour exercises a different CGRAM entry.
+  void FillCard(uint32_t slot, uint32_t phase) {
+    volatile uint8_t *buf = reinterpret_cast<volatile uint8_t *>(pix_[slot]);
     for (int y = 0; y < static_cast<int>(M7_LINE_COUNT); ++y) {
-      volatile uint16_t *row = buf + y * HD_PIXELS_PER_LINE;
-      const uint16_t base = static_cast<uint16_t>(((y / 8) + phase) & 0x1F);
-      for (int x = 0; x < HD_PIXELS_PER_LINE; ++x) {
-        const uint16_t v = static_cast<uint16_t>((base + (x / 8)) & 0x1F);
-        row[x] = static_cast<uint16_t>((v << 11) | ((v & 0x3F) << 5) | v);
+      volatile uint8_t *row = buf + y * M7_PIX_STRIDE;
+      const uint8_t base = static_cast<uint8_t>(((y / 8) + phase) & 0xFF);
+      for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x) {
+        row[x] = static_cast<uint8_t>(base + (x / 8));
       }
     }
   }
@@ -391,6 +403,7 @@ class M7Daemon {
   uint16_t loc_cg_[256];
   uint16_t line_px_[HD_PIXELS_PER_LINE];
   uint16_t ready_seq_ = 0;
+  uint32_t cur_pub_ = 0;   // buffer the last ctrl word points at
 
   // UART stream state (FPGA -> ARM, rtl/m7_reg_stream.sv framing)
   M7UartParser parser_;

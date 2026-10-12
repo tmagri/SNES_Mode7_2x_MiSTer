@@ -20,7 +20,8 @@
 #define M7_VRAM2_BASE    0x3E110000u  // VRAM plane 2 image, 64 KiB (FPGA->ARM)
 #define M7_CGRAM_BASE    0x3E120000u  // CGRAM image, 256x2 B (FPGA->ARM)
 
-#define M7_PIXBUF_BYTES  0x00070000u  // 224 lines * 1024 px * 2 B
+#define M7_PIXBUF_BYTES  0x00070000u  // buffer slot (224*256 B used, 8bpp)
+#define M7_PIX_STRIDE    256u         // native pixels per row (8bpp = bytes)
 
 // --- Header / protocol identity ---
 #define M7_MAGIC0       0x4D37u  // 'M7'
@@ -49,7 +50,10 @@
 // --- Ctrl word bits (32-bit word at M7_CTRL_BASE, ARM->FPGA) ---
 #define M7_CTRL_SEQ_LSB   0   // [15:0] ready_seq, ARM++
 #define M7_CTRL_READY_BUF 16  // buffer the daemon published
-#define M7_CTRL_DUMP_REQ  17  // daemon requests a VRAM resync dump
+#define M7_CTRL_FMT8      17  // pixbufs hold 8bpp CLUT indices (v2; MUST be set)
+#define M7_CTRL_DUMP_REQ  18  // daemon requests a VRAM resync dump
+// Bits [31:19] reserved-zero; the FPGA adopts only words with those clear
+// and FMT8 set.
 
 // VRAM image size: 32768 words (one 16-bit slot per VRAM byte).
 #define M7_VRAM_WORDS 32768u

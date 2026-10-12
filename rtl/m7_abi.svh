@@ -27,7 +27,8 @@ localparam [31:0] M7_VRAM1_BASE    = 32'h3E100000;  // VRAM plane 1 image, 64 Ki
 localparam [31:0] M7_VRAM2_BASE    = 32'h3E110000;  // VRAM plane 2 image, 64 KiB (FPGA->ARM)
 localparam [31:0] M7_CGRAM_BASE    = 32'h3E120000;  // CGRAM image, 256x2 B (FPGA->ARM)
 
-localparam [31:0] M7_PIXBUF_BYTES  = 32'h00070000;  // 224 lines * 1024 px * 2 B
+localparam [31:0] M7_PIXBUF_BYTES  = 32'h00070000;  // buffer slot (224*256 B used, 8bpp)
+localparam [8:0]  M7_PIX_STRIDE    = 9'd256;        // native pixels per row (8bpp = bytes)
 
 // --- Header / protocol identity ---
 localparam [15:0] M7_MAGIC0       = 16'h4D37;  // 'M7'
@@ -53,7 +54,10 @@ localparam [4:0] M7_HDR_SIZE_WORDS  = 16; // header is 32 bytes
 // --- Ctrl word bits (32-bit word at M7_CTRL_BASE, ARM->FPGA) ---
 localparam [4:0] M7_CTRL_SEQ_LSB   = 0;   // [15:0] ready_seq, ARM++
 localparam [4:0] M7_CTRL_READY_BUF = 16;  // buffer the daemon published
-localparam [4:0] M7_CTRL_DUMP_REQ  = 17;  // daemon requests a VRAM resync dump
+localparam [4:0] M7_CTRL_FMT8      = 17;  // pixbufs hold 8bpp CLUT indices (v2)
+localparam [4:0] M7_CTRL_DUMP_REQ  = 18;  // daemon requests a VRAM resync dump
+// Bits [31:19] reserved-zero. The FPGA adopts only words with the reserved
+// bits clear AND FMT8 set (rejects boot garbage + stale 16bpp publishers).
 
 // --- 64-bit read-port word addresses (physical byte >> 3) ---
 localparam [28:0] M7_CTRL_WORD     = 29'h07C00200;  // M7_CTRL_BASE     >> 3

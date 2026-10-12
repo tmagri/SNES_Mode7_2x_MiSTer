@@ -651,13 +651,15 @@ assign M7_SCALE       = m7_scale_wire;
 assign HD_PIXEL_VALID = hd_px_valid;
 assign HD_PIXEL_IN    = hd_pixel_in;
 
-// HD scanline buffer (v3, 2-slot row ping-pong). Port A (clk_sys) is
-// written by the fetch FSM — always the slot NOT being displayed (the
-// writer parks at row boundaries so a row never straddles a slot swap).
-// Port B (clk_video) reads one pixel per HD_PX_STROBE from the displayed
-// slot; raw RGB565 is expanded to RGB888 inside. The parent swaps slots
-// at hde falls (arm block below) and arms at hde rise only for lines
-// whose row was fetched (line_hd_in) — others fall back to native.
+// HD scanline buffer (v4, 2-slot row ping-pong, 8bpp + CLUT). Port A
+// (clk_sys) is written by the fetch FSM — always the slot NOT being
+// displayed (the writer parks at row boundaries so a row never straddles
+// a slot swap). One CLUT index byte per NATIVE pixel: a row is 32 DDR3
+// words (~18 us), so the sweep refreshes every displayed line. Port B
+// (clk_video) reads one pixel per HD_PX_STROBE and expands through the
+// CLUT (loaded from the PPU CGRAM shadow by the loader below). The parent
+// swaps slots at hde falls (arm block below) and arms at hde rise only
+// for lines whose row was fetched (line_hd_in) — others fall back native.
 reg        act = 1'b0;                  // slot the linebuf displays
 wire       m7_wr_slot = ~act;           // the fetch FSM fills the other one
 hd_mode7_linebuf linebuf (
@@ -667,6 +669,9 @@ hd_mode7_linebuf linebuf (
     .buf_wr_data(buf_wr_data),
     .buf_wr_slot(m7_wr_slot),
     .buf_wr_en(buf_wr_en),
+    .clut_wr_addr(cgram_mirror_addr),
+    .clut_wr_data(cgram_mirror_q),
+    .clut_wr_en(clut_wr_en),
     .hde_in(HBlank_out),        // PPU HDE — active-high display enable
     .line_hd_in(m7_line_hd),
     .px_strobe(HD_PX_STROBE),
@@ -1857,18 +1862,21 @@ always @(posedge clk_sys) begin
     // lands many cycles later, so ctrl_new can never coincide with
     // m7_frame_evt. Telemetry showed polls completing every frame with the
     // exact published word while daemon_present stayed 0 — the branch was
-    // unreachable by construction.) Bits [31:17] are reserved-zero in the
-    // ABI — requiring them zero rejects random boot-time DDR3 garbage in
-    // the no-daemon-yet window (a false adoption would set daemon_present
-    // and fetch garbage with nobody publishing).
+    // unreachable by construction.) Bits [31:18] are reserved-zero in the
+    // ABI and bit 17 (FMT8) must be set — requiring them rejects random
+    // boot-time DDR3 garbage in the no-daemon-yet window (a false adoption
+    // would set daemon_present and fetch garbage with nobody publishing)
+    // and stale 16bpp-format publishers.
     //
     // fetch_restart is a one-clk_sys pulse OWNED by this block (the fetch
     // FSM only reads it — a second driver there is an elaboration error).
     // Clear-before-set order means a set in the adoption branch below wins
-    // for the current cycle.
+    // for the current cycle. clut_load re-arms the palette loader so
+    // CGRAM fades track within a frame.
     if (fetch_restart)
         fetch_restart <= 1'b0;
-    if (ctrl_new && (m7_ctrl_data[31:17] == 15'd0) &&
+    if (ctrl_new && (m7_ctrl_data[31:18] == 14'd0) &&
+        m7_ctrl_data[M7_CTRL_FMT8] &&
         (m7_ctrl_data[15:0] != last_ready_seq)) begin
         daemon_present <= 1'b1;
         cur_buf        <= m7_ctrl_data[M7_CTRL_READY_BUF];
@@ -2055,9 +2063,45 @@ assign DDRAM_CLK      = clk_sys;
 // handshake (hd_req/hd_ack toggles) simply waits its turn — lost pulses
 // are structurally impossible, which was the whole cop lesson.
 //
+// ---------------------------------------------------------------------------
+// CLUT loader: once per well-formed ctrl-word completion, copy the PPU's
+// CGRAM shadow (256 BGR555 entries through the sequential mirror port) into
+// the linebuf's palette BRAM. Pure PPU-port + BRAM traffic — no DDR3
+// involvement, so it runs beside the fetch FSM. Two cycles per entry (set
+// mirror address, then write while q is valid): a full palette refresh
+// costs ~24 us, so CGRAM fades track within a frame. Trigger = ctrl_new
+// with the v2 guard bits (same shape as the adoption branch, minus the seq
+// guard — reloading an unchanged palette is harmless, and this block OWNS
+// clut_load/clut_cnt so no other always block may drive them).
+// clut_wr_addr rides cgram_mirror_addr — the address is held across the
+// write cycle, and the final entry's write drains in the first idle cycle
+// before the park (addr <= 0) lands.
+// ---------------------------------------------------------------------------
+reg        clut_load  = 1'b0;
+reg  [8:0] clut_cnt   = 9'd0;
+reg        clut_wr_en = 1'b0;
+
+always @(posedge clk_sys) begin
+    clut_wr_en <= 1'b0;
+    if (ctrl_new && (m7_ctrl_data[31:18] == 14'd0) && m7_ctrl_data[M7_CTRL_FMT8]) begin
+        clut_load <= 1'b1;
+        clut_cnt  <= 9'd0;
+    end else if (clut_load) begin
+        if (!clut_cnt[0])
+            cgram_mirror_addr <= clut_cnt[8:1];
+        else
+            clut_wr_en <= 1'b1;
+        clut_cnt <= clut_cnt + 9'd1;
+        if (&clut_cnt)
+            clut_load <= 1'b0;
+    end else begin
+        cgram_mirror_addr <= 8'd0;
+    end
+end
+
 // Address convention (rtl/m7_abi.svh): DDRAM_ADDR is a 64-bit WORD address
 // (physical byte >> 3); row r of the pixel buffer lives at word offset
-// r*256 from the buffer base, i.e. {r, fetch_word}.
+// r*32 from the buffer base, i.e. {r, fetch_word[4:0]} (8bpp, 256 B/row).
 reg  ctrl_req_s1, ctrl_req_s2, ctrl_req_s3;
 wire ctrl_req_pulse = ctrl_req_s2 ^ ctrl_req_s3;
 
@@ -2070,8 +2114,8 @@ reg [2:0]  dm_state = DM_IDLE;
 
 // linebuf write-port outputs. These are the SOLE drivers of the buf_wr_*
 // wires — hps_ext has been disconnected.
-reg  [8:0]  buf_wr_addr;    // pixel PAIR index within the line (512 pairs)
-reg  [31:0] buf_wr_data;    // two RAW RGB565 pixels (linebuf expands to 888)
+reg  [7:0]  buf_wr_addr;    // native pixel index within the row (0..255, 8bpp)
+reg  [7:0]  buf_wr_data;    // CLUT index byte (linebuf expands via CLUT)
 reg         buf_wr_en;
 reg         ctrl_pend = 1'b0;   // ctrl poll request latch (sweep-starve fix)
 reg  [7:0]  last_row_id = 8'd0; // row id sitting complete in the inactive slot
@@ -2084,9 +2128,9 @@ wire        dm_ack;
 wire [63:0] dm_dout;
 
 reg  [8:0]  fetch_row  = 9'd0;   // row currently being fetched (0..223)
-reg  [7:0]  fetch_word = 8'd0;   // 64-bit word within the row (0..255)
+reg  [7:0]  fetch_word = 8'd0;   // 64-bit word within the row (0..31, 8bpp)
 reg  [63:0] dm_word;              // latched read (stable through DM_DRAIN)
-reg  [3:0]  px_pair;
+reg  [2:0]  px_byte;              // byte within the 64-bit word (0..7)
 reg  [255:0] row_done = 256'd0;  // sticky: row ready for display
 reg         fetch_restart = 1'b0;    // frame controller: new frame adopted
 reg         fetch_pend = 1'b0;   // restart waiting for the bus to go idle
@@ -2097,18 +2141,9 @@ reg         fetch_pend = 1'b0;   // restart waiting for the bus to go idle
 reg  [12:0] dm_watchdog = 13'd0;
 reg         dm_wd_evt   = 1'b0;  // sticky for the LED panel
 
-// RGB565 -> RGB888 expansion.
-function [23:0] rgb565_to_888;
-    input [15:0] in;
-    begin
-        rgb565_to_888 = {in[15:11], in[15:13],   // R5 -> R8
-                         in[10:5],  in[10:9],    // G6 -> G8
-                         in[4:0],   in[4:2]};    // B5 -> B8
-    end
-endfunction
-
+// Row stride is 32 words (256 native bytes, 8bpp): offset = {row, word[4:0]}.
 wire [28:0] dm_word_addr = (cur_buf_s ? M7_PIXBUF_B_WORD : M7_PIXBUF_WORD)
-                           + {fetch_row, fetch_word};
+                           + {fetch_row, fetch_word[4:0]};
 
 always @(posedge clk_sys) begin
     // 3FF synchronisers for the frame-controller toggles/quasi-static
@@ -2174,25 +2209,22 @@ always @(posedge clk_sys) begin
                 dm_state  <= DM_IDLE;
             end else if (dm_req == dm_ack) begin
                 dm_word  <= dm_dout;
-                px_pair  <= 4'd0;
+                px_byte  <= 3'd0;
                 drt_cnt  <= drt_cnt + 16'd1;   // telemetry: fetch words done
                 dm_state <= DM_DRAIN;
             end
         end
 
-        // Push the word's 4 RGB565 pixels as two RAW pairs into the linebuf
-        // (32-bit port: 2 pixels/cycle; the linebuf expands 565->888 at
-        // read). The daemon packs RGB565 at 16-bit granularity,
-        // little-endian halfwords in the 64-bit word.
+        // Push the word's 8 CLUT index bytes into the linebuf (one byte per
+        // cycle, little-endian in the 64-bit word). The linebuf expands via
+        // its CLUT at read; the row completes after word 31's last byte.
         DM_DRAIN: begin
-            buf_wr_addr <= {fetch_word, px_pair[0]};
-            buf_wr_data <= (px_pair[0] == 1'b0)
-                ? {dm_word[31:16], dm_word[15:0]}
-                : {dm_word[63:48], dm_word[47:32]};
+            buf_wr_addr <= {fetch_word[4:0], px_byte};
+            buf_wr_data <= dm_word[px_byte*8 +: 8];
             buf_wr_en <= 1'b1;
-            px_pair   <= px_pair + 4'd1;
-            if (px_pair[0]) begin
-                if (fetch_word == 8'd255) begin
+            px_byte   <= px_byte + 3'd1;
+            if (px_byte == 3'd7) begin
+                if (fetch_word == 8'd31) begin
                     row_done[fetch_row] <= 1'b1;
                     last_row_id <= fetch_row[7:0];
                     fetch_word <= 8'd0;
@@ -2238,14 +2270,14 @@ always @(posedge clk_sys) begin
             dm_state   <= DM_IDLE;
             fetch_row  <= 9'd0;
             fetch_word <= 8'd0;
-            px_pair    <= 4'd0;
+            px_byte    <= 3'd0;
             row_done   <= 256'd0;
         end else if (dm_req == dm_ack) begin
             fetch_pend <= 1'b0;
             dm_state   <= DM_IDLE;   // covers DM_WAIT whose ack just landed
             fetch_row  <= 9'd0;
             fetch_word <= 8'd0;
-            px_pair    <= 4'd0;
+            px_byte    <= 3'd0;
             row_done   <= 256'd0;
         end
     end

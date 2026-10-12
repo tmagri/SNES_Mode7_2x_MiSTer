@@ -15,8 +15,6 @@ daemon/*.o
 
 # Mac
 .DS_Store
-SNES.sv__pycache__/
+__pycache__/
 daemon/test_uart_parser
 c5_pin_model_dump.txt
-output_files/
-db/

@@ -101,7 +101,7 @@ def show(seq, p, label):
           f"ppu=({u16(PPU_X)},{u16(PPU_Y)}) ddram_state={p[DDR_STATE]&3}")
     print(f"    swap: disp_row={p[DISP_ROW]} last_row={p[LAST_ROW]} "
           f"row_adv={(p[SWAP]>>7)&1} act={(p[SWAP]>>6)&1}")
-    print(f"    ctrl_read=0x{u32(CTRL_DATA):08X} (expect 0x00000001) "
+    print(f"    ctrl_read=0x{u32(CTRL_DATA):08X} (expect 0x00020001 = seq1|buf0|FMT8) "
           f"last_seq_adopted={u16(LAST_SEQ):04X} dm_word_lo=0x{u32(DM_WORD):08X}")
 
 def main():

@@ -1,39 +1,39 @@
 // ===========================================================================
-//  hd_mode7_linebuf.v  (v3)
-//  True HD Mode 7: per-scanline HD pixel buffer — 2-slot row ping-pong
+//  hd_mode7_linebuf.v  (v4 — 8bpp + CLUT, the P2c throughput fix)
+//  True HD Mode 7: per-scanline pixel buffer — 2-slot row ping-pong
 //
 //  Architecture
 //  ============
-//  The DDR3 fetch path cannot deliver a full row inside one scanline
-//  (measured on-device: ~0.56 us per 64-bit word => ~141 us per 256-word
-//  row vs a 63.5 us line), so per-line fetch-ahead is impossible. Instead
-//  the fetch engine sweeps rows CONTINUOUSLY into the slot that is NOT
-//  being displayed, one complete row at a time, and parks at row
-//  boundaries (SNES.sv DM_ROW_END / row_adv) so a row can never straddle
-//  a slot swap. The parent swaps slots at hde falls, only when the
-//  inactive slot holds a row this line hasn't shown yet; lines between
-//  fresh rows repeat the last completed row. Content stays row-coherent
-//  (no tearing, no banding); until fetch throughput rises (P2c: 8bpp+CLUT
-//  would fetch a row in ~18 us), ~1/3 of lines show a repeated row.
+//  In 16bpp the DDR3 fetch path needed ~141 us per full-width row vs a
+//  63.5 us scanline, so rows could not refresh every line (measured
+//  stall/burst slides on screen). v4 stores one CLUT INDEX byte per
+//  NATIVE pixel: a row is 256 B = 32 DDR3 words ≈ 18 us — under a third
+//  of a scanline, so the sweep stays ~3 rows ahead and every displayed
+//  line shows a fresh row.
 //
-//  Slots store RAW RGB565 pixel pairs (32 bits) — SNES colour is 15-bit
-//  anyway, and the narrower slot is what makes the second slot fit the
-//  M10K budget. Expansion to RGB888 happens at the read mux.
+//  Colour expansion moved to the display side: a 256-entry CLUT (loaded
+//  from the PPU's CGRAM shadow by SNES.sv once per adopted frame) turns
+//  each index byte into BGR555 at the read port; low-bit replication
+//  expands that to RGB888. The slot RAM shrank 16x (2 x 256 x 8), which
+//  pays for the CLUT block with room to spare.
 //
 //  Port A  (write, clk_mem = clk_sys — the DDR3 bus domain)
-//    · 32 bits = TWO RGB565 pixels per write, pushed by the fetch FSM.
-//    · buf_wr_slot selects which slot receives writes (= ~act, stable
-//      between hde falls; the parked writer guarantees no mid-row swap).
+//    · 8 bits = one CLUT index per write, pushed by the fetch FSM.
+//    · clut_wr_* writes the palette from the CGRAM mirror loader.
+//    · buf_wr_slot selects which slot receives writes (= ~act; the
+//      parked writer guarantees no mid-row swap).
 //
 //  Port B  (read, clk_vid — video/display domain)
-//    · rd_slot crosses 2FF; it only changes at hde falls, long before the
-//      first strobe of the next line.
-//    · Read pointer advances ONLY on px_strobe (consumption-indexed), so
-//      alignment holds at any video mode / scale.
-//    · hd_px_valid and hd_pixel_out are registered together: both appear
-//      one clk_vid cycle after their strobe.
+//    · rd_slot crosses 2FF; it only changes at hde falls, long before
+//      the first strobe of the next line.
+//    · Read pointer advances ONLY on px_strobe (consumption-indexed);
+//      the native index is rd_x[9:2] at the fixed 4x scale.
+//    · Two-stage pipeline: slot RAM -> CLUT -> RGB888 expansion, with
+//      hd_px_valid delayed to the stage where hd_pixel_out is stable.
+//      sys_top's overlay mux samples on valid, so the constant extra
+//      latency is transparent.
 //
-//  Arming / line sync (unchanged contract from v2)
+//  Arming / line sync (unchanged contract from v2/v3)
 //  ===============================================
 //  · hde_in is 2FF-synchronized. On its FALLING edge (end of line L's
 //    active video) the read pointer resets.
@@ -47,10 +47,15 @@ module hd_mode7_linebuf
     input             clk_vid,        // Video read domain
 
     // --- Port A: DMA write interface (clk_mem) ---
-    input      [8:0]  buf_wr_addr,    // pixel PAIR index (0..511)
-    input      [31:0] buf_wr_data,    // two RGB565 pixels
+    input      [7:0]  buf_wr_addr,    // native pixel index within the row (0..255)
+    input      [7:0]  buf_wr_data,    // CLUT index byte
     input             buf_wr_slot,    // slot being written (stable per row)
     input             buf_wr_en,
+
+    // --- CLUT write port (clk_mem, from the CGRAM mirror loader) ---
+    input      [7:0]  clut_wr_addr,
+    input      [14:0] clut_wr_data,   // BGR555 straight from the PPU shadow
+    input             clut_wr_en,
 
     // --- Line timing (hde_in from PPU, clk_sys domain) ---
     input             hde_in,         // active-high display enable
@@ -61,25 +66,31 @@ module hd_mode7_linebuf
     input             rd_slot,        // slot to display (changes at hde falls)
 
     // --- Output to sys_top overlay (clk_vid) ---
-    output reg [23:0] hd_pixel_out,
-    output reg        hd_px_valid
+    output wire [23:0] hd_pixel_out,
+    output reg         hd_px_valid
 );
 
-    reg [31:0] slotram [0:1][0:511];  // two row slots, raw RGB565 pairs
+    reg [7:0]  slotram [0:1][0:255];  // two row slots, one CLUT index/px
+    reg [14:0] clut    [0:255];       // BGR555 palette (PPU CGRAM shadow image)
 
     // ---------------------------------------------------------------------
-    // Port A: synchronous write (clk_mem)
+    // Port A: synchronous writes (clk_mem)
     // ---------------------------------------------------------------------
     always @(posedge clk_mem) begin
         if (buf_wr_en)
             slotram[buf_wr_slot][buf_wr_addr] <= buf_wr_data;
     end
 
-    // RGB565 -> RGB888 (low-bit replication, same as the daemon's encode).
-    function [23:0] rgb565_to_888(input [15:0] in);
-        rgb565_to_888 = {in[15:11], in[15:13],   // R5 -> R8
-                         in[10:5],  in[10:9],    // G6 -> G8
-                         in[4:0],   in[4:2]};    // B5 -> B8
+    always @(posedge clk_mem) begin
+        if (clut_wr_en)
+            clut[clut_wr_addr] <= clut_wr_data;
+    end
+
+    // BGR555 -> RGB888 (low-bit replication, matching the PPU's own DAC).
+    function [23:0] bgr555_to_888(input [14:0] in);
+        bgr555_to_888 = {in[4:0],  in[4:2],    // R5 -> R8
+                         in[9:5],  in[9:7],    // G5 -> G8
+                         in[14:10], in[14:12]}; // B5 -> B8
     endfunction
 
     // ---------------------------------------------------------------------
@@ -113,18 +124,13 @@ module hd_mode7_linebuf
 
     // ---------------------------------------------------------------------
     // Arming + consumption-indexed read pointer (clk_vid)
-    // rd_x is the PIXEL index (0..1023); the BRAM word (a pixel pair) is
-    // rd_x[9:1] and rd_x[0] picks the half. rd_sel is captured together
-    // with rd_data so both stay one cycle behind the strobe — aligned with
-    // hd_px_valid.
+    // rd_x counts HD strobes (0..1023 at 4x); the native slot index is
+    // rd_x[9:2]. The pointer resets at the hde fall ending the line.
     // ---------------------------------------------------------------------
     reg        armed = 1'b0;
     reg [9:0]  rd_x   = 10'd0;
-    reg        rd_sel = 1'b0;
-    reg [31:0] rd_data;
 
     always @(posedge clk_vid) begin
-        hd_px_valid <= px_strobe & armed;
         if (hde_fall) begin
             rd_x <= 10'd0;                      // next line starts
         end else if (px_strobe && armed) begin
@@ -135,15 +141,23 @@ module hd_mode7_linebuf
             armed <= fetch_en_s2 & line_hd_s2;  // show HD only if fetched
     end
 
-    // Port B: synchronous read from the displayed slot, aligned with
-    // hd_px_valid (both 1 cycle late), RGB565 expanded to RGB888.
+    // ---------------------------------------------------------------------
+    // Display pipeline: slot RAM -> CLUT -> RGB888.
+    //   strobe in T  -> rd_idx valid T+1 -> rd_rgb valid T+2; hd_px_valid
+    //   rides the same two flops (v1/v2) so valid+data land together at T+2
+    //   and hd_pixel_out (combinational expand) is stable then too.
+    // ---------------------------------------------------------------------
+    reg        v1;
+    reg [7:0]  rd_idx;
+    reg [14:0] rd_rgb;
+
     always @(posedge clk_vid) begin
-        rd_data <= slotram[rd_slot_s2][rd_x[9:1]];
-        rd_sel  <= rd_x[0];
+        rd_idx      <= slotram[rd_slot_s2][rd_x[9:2]];
+        rd_rgb      <= clut[rd_idx];
+        v1          <= px_strobe & armed;
+        hd_px_valid <= v1;
     end
 
-    always @(*) begin
-        hd_pixel_out = rgb565_to_888(rd_sel ? rd_data[31:16] : rd_data[15:0]);
-    end
+    assign hd_pixel_out = bgr555_to_888(rd_rgb);
 
 endmodule

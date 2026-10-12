@@ -26,8 +26,8 @@ All addresses are **HPS physical byte addresses**, mapped by the daemon via
 | Header | `0x3E000000` | 32 B | FPGA→ARM | identity + handshake state |
 | Per-line M7 regs | `0x3E000020` | 3584 B | FPGA→ARM | 224 lines × 8 regs × 16-bit |
 | Ctrl word | `0x3E001000` | 8 B | ARM→FPGA | publication handshake |
-| Pixel buffer A | `0x3E002000` | 448 KiB | ARM→FPGA | RGB565, 224 × 1024 px |
-| Pixel buffer B | `0x3E072000` | 448 KiB | ARM→FPGA | RGB565, 224 × 1024 px |
+| Pixel buffer A | `0x3E002000` | 448 KiB | ARM→FPGA | CLUT indices, 8 bpp, 224 × 256 B used (v3) |
+| Pixel buffer B | `0x3E072000` | 448 KiB | ARM→FPGA | CLUT indices, 8 bpp, 224 × 256 B used (v3) |
 | VRAM plane 1 image | `0x3E100000` | 64 KiB | FPGA→ARM | even VRAM bytes ($2118) |
 | VRAM plane 2 image | `0x3E110000` | 64 KiB | FPGA→ARM | odd VRAM bytes ($2119) |
 | CGRAM image | `0x3E120000` | 512 B | FPGA→ARM | 256 × BGR555 |
@@ -67,6 +67,9 @@ at the same word address**: VRAM byte `2*w` is plane 1 word `w`, VRAM byte
 **Bits [31:17] must be zero.** The FPGA rejects a ctrl word with any of
 them set as boot-time DDR3 garbage (there is no header magic anymore, so
 this zero-check is the only sanity gate on the word).
+
+> **Superseded by ctrl word v2 — see REVISION v3 below** (`FMT8` now lives
+> at bit 17; `DUMP_REQ` moved to bit 18).
 
 ## Frame protocol
 
@@ -156,3 +159,52 @@ A5 5C seq_l seq_h len_l len_h payload[0..len-1] crc8
 8 bpp + FPGA-side CLUT. Per-line fetch budget at clk_sys is the entire
 scanline (341 cycles) — fetch-ahead with line-done handshakes is mandatory;
 the CLUT option halves the fetch if the knife-edge turns out sharp.
+**Resolved — REVISION v3 below: 8 bpp + FPGA-side CLUT.**
+
+---
+
+# REVISION v3 — 8 bpp pixel buffers + FPGA-side CLUT (2026-10-13, P2c-1)
+
+Proven on device (build `187542bf` family): the 16 bpp fetch could sustain
+only ~4–5 fresh rows per frame at clk_sys (22% native fallback, visible
+seams). The 8 bpp + CLUT format cuts each row to 32 DDR3 words ≈ 18 µs
+against the 63.5 µs line → ~3.5 rows produced per displayed line; telemetry
+shows a fresh row on 94% of lines and tear-free double-buffer flips.
+
+## Ctrl word v2 (32-bit at `0x3E001000`, ARM→FPGA)
+
+| Bits | Name | Meaning |
+|---|---|---|
+| 15:0 | `READY_SEQ` | daemon increments on every published frame |
+| 16 | `READY_BUF` | buffer the daemon just finished rendering |
+| 17 | `FMT8` | **must be 1** — pixbufs hold 8 bpp CLUT indices |
+| 18 | `DUMP_REQ` | daemon requests a VRAM resync dump (consumed by P2c-3; keep 0 until then) |
+| 31:19 | — | zero |
+
+Adoption guard: the FPGA accepts a ctrl word only when
+`bits[31:18] == 0 && FMT8 == 1` — this rejects boot-time DDR3 garbage and
+any stale 16 bpp publisher in one test. First published word for
+`seq=1, buf=0` is therefore `0x00020001`. The same condition (latched once
+per frame on `ctrl_new`) also triggers the CLUT reload; reloading an
+identical palette is harmless.
+
+## Pixel buffer format (per slot, `M7_PIXBUF_BASE` / `M7_PIXBUF_B_BASE`)
+
+- 224 rows × **256 B** used (`M7_PIX_STRIDE = 256`); each byte is a CGRAM
+  palette index. Buffer regions stay 448 KiB for layout stability; only the
+  first 56 KiB is live.
+- Row `y` occupies words `[32*y, 32*y+31]` (8 index bytes per 64-bit word).
+- The daemon fills the **inactive** slot, then publishes via the ctrl word;
+  the FPGA swaps slots per line (atomic at line boundaries — tearing
+  impossible by construction).
+
+## CLUT (FPGA side, in `hd_mode7_linebuf`)
+
+- 256 × 15-bit BGR555, loaded from the PPU's live CGRAM shadow
+  (sequential mirror port) once per adopted FMT8 ctrl word — i.e. every
+  frame the daemon publishes. The game animating its palette shows through:
+  the daemon ships indices, the core supplies colors.
+- Display expansion: BGR555 → RGB888 by low-bit replication
+  (`R8 = {R5, R5[4:2]}` etc.).
+- Fixed 4× scale: native index = `rd_x[9:2]` — every native pixel consumes
+  **4 HD pixel strobes** (the display-side expansion contract).
