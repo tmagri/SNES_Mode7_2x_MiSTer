@@ -335,6 +335,11 @@ signal CGRAM_ADDR_CLR	: unsigned(7 downto 0);
 -- CGRAM write contention fix: redirect writes through Port B during active rendering
 signal CGRAM_WR_CONTENTION : std_logic;
 signal CGRAM_B_DATA        : std_logic_vector(14 downto 0);
+
+-- CGRAM shadow snoop port (muxed over the real CGRAM's two write ports)
+signal CGRAM_SH_ADDR       : std_logic_vector(7 downto 0);
+signal CGRAM_SH_DATA       : std_logic_vector(14 downto 0);
+signal CGRAM_SH_WE         : std_logic;
 signal CGRAM_B_WE          : std_logic;
 
 -- COLOR MATH
@@ -414,16 +419,25 @@ port map(
 	q_b		 => CGRAM_Q_B
 );
 
--- Phase C.1: CGRAM shadow. Snoops all writes on the original CGRAM port A.
--- Port B is dedicated to the DDR3 copy state machine in SNES.sv, which
--- pushes the full 256-entry palette into DDR3 once per frame so the ARM
--- daemon can render correct Mode 7 colors.
+-- Phase C.1: CGRAM shadow. Snoops ALL writes to the real CGRAM: port A
+-- (normal CPU palette writes) and — this was the bug — port B, which the
+-- original shadow ignored. Port B carries the CGRAM_WR_CONTENTION writes
+-- (a CPU palette write arriving mid-render is redirected there), so every
+-- such write was lost and the ARM daemon rendered with a stale palette
+-- until the next full frame without contention. Port A/B writes are
+-- mutually exclusive (port A is suppressed during contention), so one muxed
+-- snooping port suffices. Port B of the shadow is the sequential read for
+-- the DDR3 copy FSM in SNES.sv.
+CGRAM_SH_ADDR <= CGRAM_B_ADDR when CGRAM_B_WE = '1' else CGRAM_ADDR;
+CGRAM_SH_DATA <= CGRAM_B_DATA when CGRAM_B_WE = '1' else CGRAM_D;
+CGRAM_SH_WE   <= CGRAM_B_WE or CGRAM_WE;
+
 CGRAM_SHADOW : entity work.dpram generic map(8,15)
 port map(
 	clock		 => CLK,
-	address_a => CGRAM_ADDR,
-	data_a	 => CGRAM_D,
-	wren_a	 => CGRAM_WE,
+	address_a => CGRAM_SH_ADDR,
+	data_a	 => CGRAM_SH_DATA,
+	wren_a	 => CGRAM_SH_WE,
 	q_a		 => open,
 
 	address_b => CGRAM_MIRROR_ADDR,
@@ -2761,10 +2775,12 @@ begin
 	end if;
 end process;
 
--- Phase 1 Task 1.2: HD Mode 7 video mux.
--- Priority: force-blank -> ARM HD pixels (when enabled + Mode 7 active) -> standard PPU pixels.
+-- The HD Mode 7 video mux that used to live here (HD_PIXEL_IN when
+-- HD_MODE7_EN) was removed: HD_PIXEL_IN came from the CLK_VIDEO domain,
+-- so sampling it here was a clock-domain violation. The HD overlay now
+-- lives entirely in sys/sys_top.v, next to the video scaler that
+-- generates its strobe. HD_PIXEL_IN/HD_MODE7_EN remain unused inputs.
 COLOR_OUT <= (others => '0')                when BG_FORCE_BLANK = '1'                                     else
-             HD_PIXEL_IN                    when HD_MODE7_EN = '1' and BG_MODE_SYNC = "111"               else
              BRIGHT_SUB_B  & BRIGHT_SUB_G  & BRIGHT_SUB_R when DOT_CLK = '1'                             else
              BRIGHT_MAIN_B & BRIGHT_MAIN_G & BRIGHT_MAIN_R;
 DOTCLK <= DOT_CLK;

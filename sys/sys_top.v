@@ -154,7 +154,14 @@ wire led_u = ~led_user;
 wire led_locked;
 
 //LEDs on de10-nano board
+// M7_DBG_LED: HD Mode 7 write-path debug panel (see SNES.sv) — under
+// M7_DEBUG_LED it overrides the stock pattern for on-board bisection.
+wire [7:0] m7_dbg_led;
+`ifdef M7_DEBUG_LED
+assign LED = m7_dbg_led;
+`else
 assign LED = (led_overtake & led_state) | (~led_overtake & {1'b0,led_locked,1'b0, ~led_p, 1'b0, ~led_d, 1'b0, ~led_u});
+`endif
 
 wire [2:0] mcp_btn;
 wire       mcp_sdcd;
@@ -1380,37 +1387,51 @@ reg [23:0] final_rgb_out;
 reg        final_ce_pixel;
 
 wire [3:0]  m7_scale;
-wire        hd_mode7_en;
+wire        hd_px_valid;
 wire [23:0] hd_pixel_in;
+
+// One strobe per scaled output pixel. The linebuf registers hd_px_valid +
+// hd_pixel_in so they land the cycle AFTER the strobe (a BRAM read takes
+// one clk_vid), so final_ce_pixel follows the strobe window by one cycle
+// and the mux copies each HD pixel exactly when its valid/data pair is up.
+// (v3.1: the mux previously ran inside the strobe window, so pixel 0 of
+// every expanded group sampled pre-strobe valid=0 and showed the native
+// pixel while the last strobe's valid was never consumed — one native
+// pixel leaking into every group = fine vertical striping.)
+wire        HD_PX_STROBE = (scale_cnt != 4'd0);
+reg         ce_d = 1'b0;
 
 always @(posedge clk_vid) begin
 	final_ce_pixel <= 1'b0;
-	
+	ce_d           <= 1'b0;
+
 	// Reset X coordinate at HBLANK
 	if (~de_emu && hs_fix) begin
 		scale_cnt <= 0;
 	end
 	// Start generating HD pixels when the native core emits a pixel pulse
 	else if (ce_pix) begin
-		scale_cnt <= 1; 
+		scale_cnt <= 1;
 	end
-	
-	// Multiply the pixel
+
+	// Multiply the pixel: ce echoes the strobe window one cycle later
 	if (scale_cnt > 0) begin
-		final_ce_pixel <= 1'b1; 
-		
-		// MULTIPLEXER: HD Mode 7 Buffer OR Native SNES Pixel
-		if (hd_mode7_en) begin
-			final_rgb_out <= hd_pixel_in;   
-		end else begin
- 		final_rgb_out <= snes_rgb_out;  
-		end
-		
+		ce_d <= 1'b1;
 		if (scale_cnt == m7_scale) begin
-			scale_cnt <= 0; 
+			scale_cnt <= 0;
 		end else begin
 			scale_cnt <= scale_cnt + 1'd1;
 		end
+	end
+	final_ce_pixel <= ce_d;
+
+	// MULTIPLEXER: HD Mode 7 Buffer OR Native SNES Pixel.
+	// hd_px_valid (not a static enable) gates each pixel individually,
+	// so an unfetched/disabled line falls back to the native pixel.
+	if (hd_px_valid) begin
+		final_rgb_out <= hd_pixel_in;
+	end else if (~ce_d) begin
+		final_rgb_out <= snes_rgb_out;
 	end
 end
 // -------------------------------------------------------------------------
@@ -1796,8 +1817,9 @@ emu emu
 	.CLK_50M(FPGA_CLK2_50),
 	.RESET(reset),
 	.M7_SCALE(m7_scale),
-    .HD_MODE7_EN(hd_mode7_en),
+    .HD_PIXEL_VALID(hd_px_valid),
     .HD_PIXEL_IN(hd_pixel_in),
+    .HD_PX_STROBE(HD_PX_STROBE),
 	.HPS_BUS({fb_en, sl, f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,
 				 ce_hpix, hde_emu, hhs_fix, hvs_fix, 
@@ -1862,6 +1884,7 @@ emu emu
 	.ADC_BUS({ADC_SCK,ADC_SDO,ADC_SDI,ADC_CONVST}),
 
 	.DDRAM_CLK(ram_clk),
+	.M7_DBG_LED(m7_dbg_led),
 	.DDRAM_ADDR(ram_address),
 	.DDRAM_BURSTCNT(ram_burstcount),
 	.DDRAM_BUSY(ram_waitrequest),

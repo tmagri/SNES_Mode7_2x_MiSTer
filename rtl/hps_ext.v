@@ -38,27 +38,7 @@ module hps_ext
 	input      [21:0] msu_audio_sector,
 	input             msu_audio_download,
 
-	output reg [31:0] msu_data_base,
-
-	// Phase 1 Task 1.1: Mode 7 register inputs from SNES core
-	input      [15:0] m7a_in,
-	input      [15:0] m7b_in,
-	input      [15:0] m7c_in,
-	input      [15:0] m7d_in,
-	input      [12:0] m7x_in,
-	input      [12:0] m7y_in,
-	input      [12:0] m7hofs_in,
-	input      [12:0] m7vofs_in,
-
-	// Phase 2 Task 2.1: Line buffer write outputs
-	output reg [10:0] buf_wr_addr,   // Updated to 11-bit for up to 2047 pixels
-	output reg [23:0] buf_wr_data,
-	output reg        buf_wr_en,
-	output reg        buf_arm,
-
-	output reg [3:0]  m7_scale = 4'd4 // Phase 4: default 4x so HD works without
-	                                  // a CMD_M7_SET_SCALE ioctl (which requires
-	                                  // MiSTer framework integration — see daemon TODO).
+	output reg [31:0] msu_data_base
 );
 
 assign EXT_BUS[15:0] = io_dout;
@@ -67,14 +47,15 @@ assign EXT_BUS[32] = dout_en;
 wire io_strobe = EXT_BUS[33];
 wire io_enable = EXT_BUS[34];
 
+// Stock MSU-1 command set only. An earlier HD Mode 7 experiment added
+// commands 'h36-'h38 here ('h36 collided with the framework's INFO reply
+// space and the daemon never used the HPS bus — it talks over DDR3), so
+// the module is restored to stock.
 localparam EXT_CMD_MIN = CD_GET;
-localparam EXT_CMD_MAX = CMD_M7_SET_SCALE;
+localparam EXT_CMD_MAX = CD_SET;
 
 localparam CD_GET = 'h34;
 localparam CD_SET = 'h35;
-localparam CMD_M7_READ         = 'h36;
-localparam CMD_M7_WRITE_PIXELS = 'h37;
-localparam CMD_M7_SET_SCALE    = 'h38;
 
 reg [15:0] io_dout;
 reg        dout_en = 0;
@@ -91,22 +72,17 @@ always@(posedge clk_sys) begin
 		dout_en <= 0;
 		io_dout <= 0;
 		byte_cnt <= 0;
-		buf_wr_en <= 0;
-		buf_arm <= 0;
 		if(cmd == 'h35) cd_get <= 1;
 	end
 	else if(io_strobe) begin
 
 		io_dout <= 0;
-		buf_wr_en <= 0;
-		buf_arm <= 0;
 		if(~&byte_cnt) byte_cnt <= byte_cnt + 1'd1;
 
 		if(byte_cnt == 0) begin
 			cmd <= io_din;
 			dout_en <= (io_din >= EXT_CMD_MIN && io_din <= EXT_CMD_MAX);
 			if(io_din == CD_GET) io_dout <= cd_req;
-			if(io_din == CMD_M7_READ) io_dout <= m7a_in;
 		end else begin
 			case(cmd)
 				CD_GET:
@@ -125,35 +101,6 @@ always@(posedge clk_sys) begin
 							2: cd_out[31:16] <= io_din;
 							3: cd_out[47:32] <= io_din;
 						endcase
-					end
-					
-				CMD_M7_READ:
-					if(!byte_cnt[9:3]) begin
-						case(byte_cnt[2:0])
-							1: io_dout <= m7b_in;
-							2: io_dout <= m7c_in;
-							3: io_dout <= m7d_in;
-							4: io_dout <= {3'b000, m7x_in};
-							5: io_dout <= {3'b000, m7y_in};
-							6: io_dout <= {3'b000, m7hofs_in};
-							7: io_dout <= {3'b000, m7vofs_in};
-						endcase
-					end
-					
-				CMD_M7_WRITE_PIXELS:
-					begin
-						// ARM writes 16-bit RGB565 per pixel. Convert to 24-bit RGB888.
-						buf_wr_addr <= byte_cnt[10:0] - 11'd1;
-						buf_wr_data <= {io_din[15:11], io_din[15:13], io_din[10:5], io_din[10:9], io_din[4:0], io_din[4:2]};
-						buf_wr_en   <= 1;
-
-						// If ARM has written all pixels, arm the line buffer.
-						if (byte_cnt == 256 * m7_scale) buf_arm <= 1; 
-					end
-				
-				CMD_M7_SET_SCALE:
-					if(byte_cnt == 1) begin
-						m7_scale <= io_din[3:0];
 					end
 			endcase
 		end

@@ -1,41 +1,18 @@
-db
-greybox_tmp
-incremental_db
-output_files
-simulation
-hc_output
-scaler
-hps_isw_handoff
-vip
-*_sim
-.qsys_edit
-PLLJ_PLLSPE_INFO.txt
-*.bak
-*.orig
-*.rej
-*.qdf
+# Quartus build artifacts
+output_files/
+incremental_db/
 *.rpt
-*.smsg
-*.summary
-*.done
 *.jdi
-*.pin
-*.sof
+*.sld
+db/
+greybox_tmp/
 *.qws
-*.ppf
-*.ddb
-build_id.v
-c5_pin_model_dump.txt
-*.sopcinfo
-*.csv
-*.f
-*.cmp
-*.sip
-*.spd
-*.bsf
-*~
-*.xml
-*.cdf
+db_incremental_basin_1306/
+
+# ARM daemon build artifacts
+daemon/m7_daemon
+daemon/*.o
 
 # Mac
 .DS_Store
+SNES.sv__pycache__/

@@ -1,55 +1,107 @@
 #!/bin/bash
 #
-# snes_hd_m7.sh — load the experimental HD Mode 7 SNES core and start the
-# ARM daemon safely. Intended to be launched from the MiSTer OSD Scripts menu.
+# SNES_HD_M7.sh — load the HD Mode 7 SNES core and start the ARM daemon.
+# Installed to /media/fat/Scripts/SNES_HD_M7.sh by scripts/install_to_mister.sh
+# and launched from the MiSTer OSD Scripts menu.
 #
-# Important: the daemon must NEVER run when another core is loaded, because
-# it pokes the HPS lightweight bridge directly. We verify the loaded core
-# name before launching, and we background the daemon so the OSD Scripts
-# menu regains control (foregrounding it competes with the framework's
-# PS/2 input loop and causes spurious save/load key events).
+# Support layout (installed by install_to_mister.sh):
+#   /media/fat/Scripts/.SNES_HD_M7/support/SNES_Mode7_HD.rbf (+ .sha256)
+#   /media/fat/Scripts/.SNES_HD_M7/support/m7_daemon          (+ .sha256)
+#
+# Notes:
+#  * The daemon talks ONLY to shared DDR3 via /dev/mem (docs/m7_abi.md).
+#    It never touches the HPS io bus, so the framework keeps running.
+#  * The daemon self-gates on the FPGA's magic/version header: with the
+#    wrong (stock) core loaded it exits 2 instead of writing garbage.
+#  * Logs: /tmp/m7_daemon.log. PID: /tmp/m7_daemon.pid
 
-set -u
+set -eu
 
-CORE_RBF="/media/fat/_Console/SNES_Mode7_HD.rbf"
-DAEMON="/media/fat/daemon/m7_daemon"
+SUPPORT_DIR="/media/fat/Scripts/.SNES_HD_M7/support"
+CORE_RBF="$SUPPORT_DIR/SNES_Mode7_HD.rbf"
+DAEMON="$SUPPORT_DIR/m7_daemon"
 LOG="/tmp/m7_daemon.log"
-EXPECTED_CORE="SNES"   # substring matched against /tmp/CORENAME
+PIDFILE="/tmp/m7_daemon.pid"
+LOCK="/tmp/.SNES_HD_M7.lock"
+CORENAME_FILE="/tmp/CORENAME"
 
-# 1. Kill any previously-launched daemon (e.g. user re-ran the script).
-pkill -f "$DAEMON" 2>/dev/null
-sleep 0.2
+log() { echo "[SNES_HD_M7] $*"; }
+fail() { log "ERROR: $*"; exit 1; }
 
-# 2. Instruct the MiSTer framework to load the custom SNES core.
-if [ ! -f "$CORE_RBF" ]; then
-    echo "ERROR: $CORE_RBF not found" >&2
-    exit 1
+# --- sanity ---------------------------------------------------------------
+[ -f "$CORE_RBF" ] || fail "$CORE_RBF missing — run scripts/install_to_mister.sh"
+[ -x "$DAEMON" ]   || fail "$DAEMON missing or not executable"
+
+sha_ok() {  # sha_ok <file>
+    local f="$1"
+    [ -f "$f.sha256" ] || return 0   # sidecar optional
+    ( cd "$(dirname "$f")" && sha256sum -c "$(basename "$f").sha256" >/dev/null 2>&1 )
+}
+
+sha_ok "$CORE_RBF" || fail "SNES_Mode7_HD.rbf failed its sha256 check — reinstall"
+sha_ok "$DAEMON"   || fail "m7_daemon failed its sha256 check — reinstall"
+
+# --- single instance -------------------------------------------------------
+exec 9>"$LOCK"
+flock -n 9 || fail "another SNES_HD_M7 run is active"
+
+# --- stop a previously-launched daemon -------------------------------------
+if [ -f "$PIDFILE" ]; then
+    OLDPID="$(cat "$PIDFILE" 2>/dev/null || true)"
+    [ -n "$OLDPID" ] && kill "$OLDPID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    sleep 0.3
 fi
+pkill -f "m7_daemon" 2>/dev/null || true
+
+# --- load the HD core -------------------------------------------------------
+log "loading $CORE_RBF"
+# Clear CORENAME first: it keeps its previous value on a failed load, so the
+# poll below must only trust a SNES value written AFTER this point.
+echo "MENU" > "$CORENAME_FILE"
 echo "load_core $CORE_RBF" > /dev/MiSTer_cmd
 
-# 3. Wait for the FPGA to configure and the framework to update CORENAME.
-for i in $(seq 1 20); do
-    sleep 0.2
-    if [ -r /tmp/CORENAME ] && grep -q "$EXPECTED_CORE" /tmp/CORENAME; then
+# Wait for the FPGA to configure and the framework to publish CORENAME.
+CORE_OK=0
+for _ in $(seq 1 40); do
+    sleep 0.25
+    if [ -r "$CORENAME_FILE" ] && grep -q "SNES" "$CORENAME_FILE"; then
+        CORE_OK=1
         break
     fi
 done
+[ "$CORE_OK" = 1 ] || fail "core did not load (CORENAME=$(cat "$CORENAME_FILE" 2>/dev/null || echo '?'))"
 
-if ! grep -q "$EXPECTED_CORE" /tmp/CORENAME 2>/dev/null; then
-    echo "ERROR: core did not load (CORENAME=$(cat /tmp/CORENAME 2>/dev/null))" >&2
-    exit 1
+# --- kernel module (optional, best-effort) ----------------------------------
+# /dev/m7_mem_wc gives the daemon a write-combined pixel window (see
+# kernel/m7_mem_wc). Built and insmod'ed on first run; any failure is
+# non-fatal — the daemon falls back to plain /dev/mem.
+WC_DEV="/dev/m7_mem_wc"
+KMOD_DIR="$SUPPORT_DIR/kernel/m7_mem_wc"
+if [ ! -e "$WC_DEV" ]; then
+    if [ -f "$KMOD_DIR/m7_mem_wc.c" ]; then
+        log "m7_mem_wc not loaded — building/inserting (first run may take a minute)"
+        if ! lsmod | grep -q "m7_mem_wc"; then
+            ( cd "$KMOD_DIR" && make >>/tmp/m7_kmod_build.log 2>&1 ) &&
+                insmod "$KMOD_DIR/m7_mem_wc.ko" 2>>/tmp/m7_kmod_build.log ||
+                log "WARNING: m7_mem_wc unavailable — daemon uses /dev/mem (see /tmp/m7_kmod_build.log)"
+        fi
+    fi
 fi
 
-# 4. Launch the daemon backgrounded, idle I/O priority, lowest CPU priority,
-#    stdout/stderr redirected to a logfile so it cannot interfere with the
-#    OSD/SSH terminal that the framework is using for keyboard input.
-if [ ! -x "$DAEMON" ]; then
-    echo "ERROR: $DAEMON missing or not executable" >&2
-    exit 1
+# --- launch the daemon ------------------------------------------------------
+# Backgrounded + niced so the OSD regains control immediately and controller
+# polling (SPI) keeps its latency.
+log "starting m7_daemon"
+( nice -n 19 "$DAEMON" ${M7_DAEMON_ARGS:-} >>"$LOG" 2>&1 & echo $! > "$PIDFILE" )
+
+sleep 1
+if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    RC="?"
+    tail -n 5 "$LOG" >&2 || true
+    fail "daemon exited immediately (see $LOG)"
 fi
 
-nice -n 19 ionice -c 3 "$DAEMON" >"$LOG" 2>&1 &
-DAEMON_PID=$!
-disown "$DAEMON_PID" 2>/dev/null
-
-echo "m7_daemon started (pid $DAEMON_PID); log at $LOG"
+log "HD Mode 7 active (pid $(cat "$PIDFILE")). Log: $LOG"
+log "Run SNES_HD_M7_stop.sh (or load any other game) to stop."
+exit 0

@@ -27,13 +27,18 @@ module emu
 	//Can be used as initial reset.
 	input         RESET,
 
-	// Dynamic HD Canvas Overlay signals to share with sys_top
+	// Dynamic HD Canvas Overlay signals to share with sys_top.
+	// HD_PIXEL_VALID is a clk_video-domain strobe aligned with HD_PIXEL_IN:
+	// asserted exactly on cycles where an HD pixel is presented (so sys_top
+	// can mux it in place of the native pixel). HD_PX_STROBE is the return
+	// path: sys_top's pixel-repeat engine asserts it one clk_video cycle
+	// before each emitted output pixel, and hd_mode7_linebuf advances its
+	// read pointer only on that strobe (consumption-indexed for any video
+	// mode / PLL rate).
 	output [3:0]  M7_SCALE,
-    output        HD_MODE7_EN,
+    output        HD_PIXEL_VALID,
     output [23:0] HD_PIXEL_IN,
-	// HD_X_COORD was an undriven top-level input (the MiSTer framework has
-	// no such port), so Quartus tied it to 0 and the line buffer always
-	// read linebuf[0]. The read counter now lives inside hd_mode7_linebuf.
+	input         HD_PX_STROBE,
 
 	//Must be passed to hps_io module
 	inout  [48:0] HPS_BUS,
@@ -133,6 +138,7 @@ module emu
 	output [28:0] DDRAM_ADDR,
 	input  [63:0] DDRAM_DOUT,
 	input         DDRAM_DOUT_READY,
+	output [7:0]  M7_DBG_LED,   // HD Mode 7 debug bisect (see sys_top LED mux)
 	output        DDRAM_RD,
 	output [63:0] DDRAM_DIN,
 	output  [7:0] DDRAM_BE,
@@ -305,6 +311,9 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | spc_download | bk_
 // XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 `include "build_id.v"
+// Shared Mode 7 ABI constants — included before any use (m7_scale_wire at the
+// linebuf instance and the Phase D engine both reference these).
+`include "rtl/m7_abi.svh"
 parameter CONF_STR = {
 	"SNES;SS3F800000:100000,UART31250,MIDI;",
 	"FS1,SFCSMCBINBS ;",
@@ -621,48 +630,64 @@ wire [12:0] m7x_out, m7y_out, m7hofs_out, m7vofs_out;
 
 // Phase 2 Task 2.1: HD Mode 7 Line Buffer wires
 wire [8:0]  x_out;
-wire        frame_out;
+wire        frame_out;      // PPU BG strobe — NOT a frame boundary (unused, see M7 block)
 wire [23:0] hd_pixel_in;
-wire        hd_mode7_en;
-
-// Phase 3: buf_wr_* are now driven by the DMA reader (reg, declared later
-// near the state machine). Linebuf module wants 11-bit addr for up to 2047
-// pixels; keep widths consistent here.
-wire [3:0]  m7_scale_wire;
+wire        hd_px_valid;
+wire        vblank_out;     // PPU IN_VBL — true vblank level (frame boundary)
 `ifdef M7_2X_ENABLE
-assign M7_SCALE    = m7_scale_wire;
-assign HD_MODE7_EN = hd_mode7_en;
-assign HD_PIXEL_IN = hd_pixel_in;
+// VRAM resync-dump address mux (drives the vram1/vram2 port-B mux below;
+// port B is the PPU fetch port, idle during vblank when dumps run).
+// Each plane's port B is hijacked only while that plane is being dumped.
+wire        dump_a_p1, dump_a_p2;
+wire [14:0] dump_addr;
+`endif
+
+`ifdef M7_2X_ENABLE
+// HD scale is fixed at 4x (hd_mode7_linebuf timing + daemon pixel buffer
+// layout are validated at this rate; see rtl/m7_abi.svh).
+localparam [3:0] m7_scale_wire = M7_HD_SCALE;
+
+assign M7_SCALE       = m7_scale_wire;
+assign HD_PIXEL_VALID = hd_px_valid;
+assign HD_PIXEL_IN    = hd_pixel_in;
+
+// HD scanline buffer (v3, 2-slot row ping-pong). Port A (clk_sys) is
+// written by the fetch FSM — always the slot NOT being displayed (the
+// writer parks at row boundaries so a row never straddles a slot swap).
+// Port B (clk_video) reads one pixel per HD_PX_STROBE from the displayed
+// slot; raw RGB565 is expanded to RGB888 inside. The parent swaps slots
+// at hde falls (arm block below) and arms at hde rise only for lines
+// whose row was fetched (line_hd_in) — others fall back to native.
+reg        act = 1'b0;                  // slot the linebuf displays
+wire       m7_wr_slot = ~act;           // the fetch FSM fills the other one
+hd_mode7_linebuf linebuf (
+    .clk_mem(clk_sys),
+    .clk_vid(CLK_VIDEO),
+    .buf_wr_addr(buf_wr_addr),
+    .buf_wr_data(buf_wr_data),
+    .buf_wr_slot(m7_wr_slot),
+    .buf_wr_en(buf_wr_en),
+    .hde_in(HBlank_out),        // PPU HDE — active-high display enable
+    .line_hd_in(m7_line_hd),
+    .px_strobe(HD_PX_STROBE),
+    .fetch_en(m7_fetch_en),
+    .rd_slot(act),
+    .hd_pixel_out(hd_pixel_in),
+    .hd_px_valid(hd_px_valid)
+);
 `else
-// HD Mode 7 (2x) is compiled out so the design fits the 553 M10K block
+// HD Mode 7 is compiled out so the design fits the 553 M10K block
 // budget. sys_top's scaler runs at 1x (one output pixel per native ce_pix),
 // and the HD overlay / pixel path are forced off.
-assign M7_SCALE    = 4'd1;
-assign HD_MODE7_EN = 1'b0;
-assign HD_PIXEL_IN = 24'd0;
-assign hd_pixel_in = 24'd0;
-assign hd_mode7_en = 1'b0;
+assign M7_SCALE       = 4'd1;
+assign HD_PIXEL_VALID = 1'b0;
+assign HD_PIXEL_IN    = 24'd0;
+assign hd_pixel_in    = 24'd0;
+assign hd_px_valid    = 1'b0;
 `endif
 
 wire [8:0] ppu_x;
 wire [8:0] ppu_y;
-
-`ifdef M7_2X_ENABLE
-hd_mode7_linebuf linebuf (
-    .clk_sys(clk_sys),
-    .clk_vid(CLK_VIDEO),
-    .buf_wr_addr(buf_wr_addr),
-    .buf_wr_data(buf_wr_data),
-    .buf_wr_en(buf_wr_en),
-    .buf_arm(buf_arm),
-    // Phase B fix: hblank is synchronized inside the linebuf; the read
-    // address is an internal counter. No external hd_x_out / line_start.
-    .hblank_in(HBlank_out),
-    .hd_width(HD_WIDTH[10:0]),
-    .hd_pixel_in(hd_pixel_in),
-    .hd_mode7_en(hd_mode7_en)
-);
-`endif
 
 main main
 (
@@ -742,6 +767,7 @@ main main
 	
 	.HBLANKn(HBlank_out),
 	.VBLANKn(VBlank_out),
+	.VBLANK_OUT(vblank_out),
 	.HSYNC(HSYNC_out),
 	.VSYNC(VSYNC_out),
 
@@ -793,11 +819,12 @@ main main
 	.M7HOFS_OUT(m7hofs_out),
 	.M7VOFS_OUT(m7vofs_out),
 
-	// Phase 1: HD pixel mux inputs
-	.HD_PIXEL_IN(hd_pixel_in),
-	.HD_MODE7_EN(hd_mode7_en),
+	// HD pixel ports are unused inside the PPU now (the overlay moved to
+	// sys_top); the inputs stay tied off for port compatibility.
+	.HD_PIXEL_IN(24'd0),
+	.HD_MODE7_EN(1'b0),
 
-	// Phase C.1: CGRAM mirror read port
+	// Phase C.1: CGRAM shadow read port
 	.CGRAM_MIRROR_ADDR(cgram_mirror_addr),
 	.CGRAM_MIRROR_Q(cgram_mirror_q),
 
@@ -1042,8 +1069,11 @@ dpram #(15)	vram1
 	.wren_a(~VRAM1_WE_N),
 	.q_a(vram1_q),
 
-	// clear the RAM on loading, else route port B
-	.address_b(clearing_ram ? mem_fill_addr[14:0] : VRAM1_ADDR_B[14:0]),
+	// clear the RAM on loading, resync-dump during vblank, else route port B.
+	// The dump muxes the PPU fetch port (idle during vblank) so CPU port-A
+	// accesses are never delayed.
+	.address_b(dump_a_p1 ? dump_addr :
+	           clearing_ram ? mem_fill_addr[14:0] : VRAM1_ADDR_B[14:0]),
 	.wren_b(mem_fill_we),
 	.q_b(VRAM1_Q_B)
 );
@@ -1064,29 +1094,28 @@ dpram #(15) vram2
 	.wren_a(~VRAM2_WE_N),
 	.q_a(vram2_q),
 
-	// clear the RAM on loading, else route port B
-	.address_b(clearing_ram ? mem_fill_addr[14:0] : VRAM2_ADDR_B[14:0]),
+	// clear the RAM on loading, resync-dump during vblank, else route port B
+	// (dump hijacks port B only while plane 2 is being dumped)
+	.address_b(dump_a_p2 ? dump_addr :
+	           clearing_ram ? mem_fill_addr[14:0] : VRAM2_ADDR_B[14:0]),
 	.wren_b(mem_fill_we),
 	.q_b(VRAM2_Q_B)
 );
 wire  [7:0] VRAM2_Q = !VRAM_OE_N && !VRAM_OE_N_DELAYED ? vram2_q : '1; 
 
 // ===========================================================================
-// Phase C.1: Shadow VRAM for DDR3 mirror.
-// Each shadow snoops the CPU write port (port A) of the matching VRAM.
-// Port B is read sequentially by the copy state machine below, which pushes
-// the full VRAM contents to DDR3 once per frame so the ARM daemon can do
-// real Mode 7 tile rendering. Dirty flags avoid needless re-copy when the
-// game isn't modifying VRAM (common during SMK races).
+// CGRAM shadow read port for the DDR3 copy FSM.
 //
-// BRAM conservation: Mode 7 only uses the first 16K entries of each VRAM
-// bank (tilemap 128×128 + tile data 256×64 = 16384 entries each). The
-// mirrors are 16K-deep (14-bit address), not 32K, to fit within the
-// Cyclone V's 553 M10K blocks.
+// VRAM has no shadow mirror any more: VRAM reaches DDR3 through write-through
+// snooping of the CPU write strobes (~VRAM1_WE_N / ~VRAM2_WE_N) plus a full
+// resync dump muxed onto the real VRAM port B during vblank when needed
+// (see the M7 engine block below). That removes 32 M10K blocks versus the
+// old mirror design.
+//
+// CGRAM keeps its PPU-side shadow (CGRAM_SHADOW inside PPU.vhd, which now
+// snoops BOTH write ports) and only the sequential read port is exposed
+// here for the copy FSM. With M7_2X_ENABLE off it is tied low.
 // ===========================================================================
-reg [13:0] vram_mirror_addr;
-wire [7:0]  vram1_mirror_q;
-wire [7:0]  vram2_mirror_q;
 reg [7:0]  cgram_mirror_addr;
 
 `ifndef M7_2X_ENABLE
@@ -1095,32 +1124,6 @@ always @(*) begin
 end
 `endif
 wire [14:0] cgram_mirror_q;
-
-reg vram1_dirty, vram2_dirty, cgram_dirty;
-
-`ifdef M7_2X_ENABLE
-dpram #(14) vram1_mirror
-(
-	.clock(clk_sys),
-	.address_a(VRAM1_ADDR[13:0]),
-	.data_a(VRAM1_D),
-	.wren_a(~VRAM1_WE_N),
-	.address_b(vram_mirror_addr),
-	.wren_b(1'b0),
-	.q_b(vram1_mirror_q)
-);
-
-dpram #(14) vram2_mirror
-(
-	.clock(clk_sys),
-	.address_a(VRAM2_ADDR[13:0]),
-	.data_a(VRAM2_D),
-	.wren_a(~VRAM2_WE_N),
-	.address_b(vram_mirror_addr),
-	.wren_b(1'b0),
-	.q_b(vram2_mirror_q)
-);
-`endif
 
 wire [15:0] ARAM_ADDR;
 wire        ARAM_CE_N;
@@ -1245,6 +1248,18 @@ video_mixer #(.LINE_LENGTH(520), .GAMMA(1)) video_mixer
 
 assign {UART_RTS, UART_DTR} = 1;
 
+wire uart_txd_core;
+`ifdef M7_2X_ENABLE
+// HD Mode 7 build: UART_TXD carries the m7_reg_stream FPGA->ARM channel
+// (sys_top routes the core's UART_TXD to the HPS UART1 controller ->
+// /dev/ttyS1) instead of the Miracle Piano uart below (idle unless
+// uart_mode=3). The piano/SNI uart still runs; only its pin is muted.
+wire m7_dbg_tx;
+assign UART_TXD = m7_dbg_tx;
+`else
+assign UART_TXD = uart_txd_core;
+`endif
+
 wire piano = status[43] & (uart_mode == 3);
 reg last_piano = 1'b0;
 always @(posedge clk_sys) last_piano <= piano;
@@ -1268,7 +1283,7 @@ uart uart(
 	.rbfmirror(rbf),
 	.txint(txint),
 	.rxint(rxint),
-	.txd(UART_TXD),
+	.txd(uart_txd_core),
 	.rxd(UART_RXD)
 );
 
@@ -1580,23 +1595,12 @@ hps_ext hps_ext
 	.msu_audio_sector(msu_audio_sector),
 	.msu_audio_download(msu_audio_download),
 
-	.msu_data_base(msu_data_base),
+	.msu_data_base(msu_data_base)
 
-	// Phase 2 Task 2.2: Mode 7 register inputs from SNES core
-	.m7a_in(m7a_out),
-	.m7b_in(m7b_out),
-	.m7c_in(m7c_out),
-	.m7d_in(m7d_out),
-	.m7x_in(m7x_out),
-	.m7y_in(m7y_out),
-	.m7hofs_in(m7hofs_out),
-	.m7vofs_in(m7vofs_out),
-
-	// Phase 3 Task 3.6: DMA reader now owns the linebuf write path.
-	// hps_ext is no longer permitted to drive buf_wr_* (would cause a
-	// multiple-driver collision). Only CMD_M7_READ and CMD_M7_SET_SCALE
-	// remain on this instance.
-	.m7_scale(m7_scale_wire)
+	// The old CMD_M7_* commands (0x36-0x38) were removed: 0x36 collides with
+	// the MiSTer framework's INFO query in hps_io.sv (hijacking OSD/savestate
+	// info replies), and the daemon never used the HPS io bus — it works via
+	// the DDR3 mailbox in the M7 block below.
 );
 
 wire        msu_track_mounting;
@@ -1674,258 +1678,222 @@ wire        msu_ram_req;
 wire        msu_ram_ack;
 wire [63:0] msu_ram_dout;
 
-//assign DDRAM_CLK = clk_mem;
-
 // ===========================================================================
-// Phase C.3: Per-line M7 Register Capture + DDR3 Frame Writer
+// Phase D: HD Mode 7 shared-memory engine (clk_sys)
 //
-// SMK (and many other Mode 7 games) use HDMA to change M7A/M7B/M7C/M7D
-// every scanline for pseudo-3D perspective. The previous per-frame mailbox
-// captured only ONE register set per frame — useless for HDMA games.
+// The ARM daemon (daemon/m7_daemon.cpp) mmaps HPS DDR3 at M7_MAILBOX_BASE
+// and cooperates with this block per docs/m7_abi.md:
+//   * header (magic/version/heartbeat) + per-line M7 register mailbox
+//   * VRAM/CGRAM plane images, kept current by write-through + resync dumps
+//   * HD pixel ping-pong buffers, fetched by the DDR3 DMA further below
+//   * ctrl word (ARM -> FPGA) for frame publication and dump requests
 //
-// This block captures all 8 registers at each scanline into a BRAM, then
-// dumps the full per-line table to DDR3 during vertical blanking.
+// Every DDR3 write below goes through the ddram.sv 16-bit write port. Its
+// wraddr is a PHYSICAL BYTE address (rtl/m7_abi.svh): 16-bit entry i of a
+// region at byte base B is written at B + 2*i, i.e. {idx,1'b0} + base.
 //
-// Memory map (daemon reads via mmap at 0x3E000000):
-//   0x3E000000  Per-line mailbox: 224 lines × 8 regs × 2 bytes = 3584 B
-//   0x3E002000  HD pixel buffer
-//   0x3E100000  VRAM1 mirror (32K entries)
-//   0x3E108000  VRAM2 mirror (32K entries)
-//   0x3E110000  CGRAM mirror (256 entries)
-//
-// VRAM mirrors use dirty flags (skip when static). CGRAM is always copied.
+// A single service FSM owns the port and re-evaluates priority per write:
+//   VRAM write-through > per-line mailbox > header > CGRAM copy > resync
+//   dump — so the long-running copies can never delay a write-through long
+//   enough to overflow its small FIFO.
 // ===========================================================================
-localparam [29:0] MB_BASE_ADDR    = 30'h3E000000 >> 1;
-localparam [31:1] VRAM1_DDR3_BASE = 31'h1F080000; // 0x3E100000 >> 1
-localparam [31:1] VRAM2_DDR3_BASE = 31'h1F084000; // 0x3E108000 >> 1
-localparam [31:1] CGRAM_DDR3_BASE = 31'h1F088000; // 0x3E110000 >> 1
-localparam [15:0] ML_LINE_COUNT   = 16'd224;  // active display lines
-localparam [15:0] ML_ENTRY_COUNT  = 16'd1792; // 224 lines × 8 regs
 
-// --- DDR3 16-bit write port signals (shared by all regions) ---
-reg  [31:1] mb_wraddr;
-reg  [15:0] mb_din;
-
-`ifndef M7_2X_ENABLE
-always @(*) begin
-    mb_wraddr = 31'd0;
-    mb_din = 16'd0;
-end
-`endif
-reg         mb_we_req = 1'b0;
-wire        mb_we_ack;
-
-// --- Per-line M7 register capture BRAM ---
-// Port A: capture logic writes 8 regs per line during active display.
-// Port B: copy state machine reads sequentially during vblank.
-wire [10:0] m7_lb_wr_addr;
-reg  [10:0] m7_lb_rd_addr;
-wire [15:0] m7_lb_wr_data;
-wire        m7_lb_wr_en;
-wire [15:0] m7_lb_rd_data;
+// PIVOT v2: the DDR3 mailbox writer (mb_* signals + 16-bit write port) is
+// GONE — see the ddram instance comment. The only DDR3 writer is the ARM
+// daemon; everything this core used to push into the mailbox now flows to
+// it over the HPS UART (rtl/m7_reg_stream.sv).
 
 `ifdef M7_2X_ENABLE
-dpram #(11) m7_linebuf (
-	.clock(clk_sys),
-	.address_a(m7_lb_wr_addr),
-	.data_a(m7_lb_wr_data),
-	.wren_a(m7_lb_wr_en),
-	.q_a(),
-	.address_b(m7_lb_rd_addr),
-	.wren_b(1'b0),
-	.q_b(m7_lb_rd_data)
-);
+// --- Frame timing: IN_VBL rising edge is the true frame boundary ---------
+reg  vbl_d;
+wire frame_start = vblank_out & ~vbl_d;
+
+// DEBUG (M7_DEBUG_MAILBOX): OR in a free-running ~20 Hz event so the mailbox
+// writer can be validated independently of the PPU vblank chain. Production
+// builds leave m7_frame_evt == frame_start.
+`ifdef M7_DEBUG_MAILBOX
+reg [19:0] dbg_evt_t = 20'd0;
+always @(posedge clk_sys) dbg_evt_t <= dbg_evt_t + 20'd1;
+wire       m7_frame_evt = frame_start | (&dbg_evt_t);
+`else
+wire       m7_frame_evt = frame_start;
 `endif
 
-// Capture state (all registered)
+// --- Ctrl-word readback path (DDRAM_CLK-domain DMA toggles ctrl_done) ----
+reg  [31:0] m7_ctrl_data;         // captured ctrl word (quasi-static)
+reg         ctrl_req = 1'b0;      // toggled once per frame
+reg         ctrl_done = 1'b0;     // toggled in the DDRAM_CLK domain when valid
+reg         ctrl_done_s1, ctrl_done_s2, ctrl_done_s3;
+wire        ctrl_new = ctrl_done_s2 ^ ctrl_done_s3;
+
+// --- Handshake state ------------------------------------------------------
+// frame_seq is kept as a free-running heartbeat for future stream messages;
+// the v1 header block (which carried it to the daemon over DDR3) is gone.
+reg  [15:0] frame_seq = 16'd0;        // heartbeat
+reg         cur_buf = 1'b0;           // pixel buffer the DMA reads this frame
+reg         daemon_present = 1'b0;    // set on first adopted ctrl frame
+reg  [15:0] last_ready_seq = 16'hFFFF;
+// Telemetry counters for the UART stream (each owned by exactly one block)
+reg [15:0] fs_cnt  = 16'd0;   // frame events (frame controller block)
+reg [15:0] cdn_cnt = 16'd0;   // ctrl_new pulses = completed ctrl polls
+reg [15:0] drt_cnt = 16'd0;   // DM_DRAIN entries = completed fetch words
+reg [15:0] dout_cnt = 16'd0;  // DDRAM_DOUT_READY rising edges (any client)
+reg [15:0] hde_cnt = 16'd0;   // hde falls this frame (arm block)
+reg [15:0] arm_cnt = 16'd0;   // lines armed HD this frame (arm block)
+// VRAM write-through versions/drop counter — bumped by the snoop below;
+// their consumers move to the UART stream in P2c (kept so the snoop logic
+// is already in its final shape).
+reg  [15:0] vram1_ver = 16'd0, vram2_ver = 16'd0, wt_drops = 16'd0;
+
+// The v1 VRAM resync-dump-over-DDR3 machinery is gone with the mailbox
+// writer (P2c re-ships VRAM/CGRAM over the UART instead). The VRAM port-B
+// dump mux inputs (wires declared near the VRAM port above) are tied off
+// so the fetch path is unconditional.
+assign dump_a_p1 = 1'b0;
+assign dump_a_p2 = 1'b0;
+assign dump_addr = 15'd0;
+wire dump_busy = 1'b0;
+
+// HD fetch gating — quasi-static (changes at frame granularity at most)
+wire m7_fetch_en = daemon_present;
+
+// --- Per-line M7 register capture + streaming -----------------------------
+// At start_of_scanline of line L the PPU registers hold exactly what line L
+// uses (HDMA applied during the previous line's blanking). The 8 registers
+// are latched and then streamed straight to DDR3 by the service FSM — no
+// BRAM staging. 16-bit entry (L,i) lands at wraddr = M7_REGS_BASE>>1
+// + 8*L + i. ddram.sv's wraddr is a byte address with bit 0 stripped, so
+// the old factor-of-2 address bug is structurally impossible here.
 reg [7:0]  ml_line;
-reg [2:0]  ml_cap_idx;
-reg        ml_cap_active;
+reg [2:0]  ml_idx;
+reg        ml_run;
 reg [15:0] ml_a, ml_b, ml_c, ml_d;
 reg [12:0] ml_x, ml_y, ml_hofs, ml_vofs;
 
-`ifdef M7_2X_ENABLE
-// Per-line capture: at each start_of_scanline, latch all 8 register
-// values, then advance ml_cap_idx over 8 cycles. The BRAM port-A
-// signals below are COMBINATIONAL (derived from the registered state),
-// so address and data always agree.
-always @(posedge clk_sys) begin
-	if (frame_out) begin
-		ml_line       <= 8'd0;
-		ml_cap_active <= 1'b0;
-	end else if (start_of_scanline && ml_line < 8'd224) begin
-		ml_a    <= m7a_out;
-		ml_b    <= m7b_out;
-		ml_c    <= m7c_out;
-		ml_d    <= m7d_out;
-		ml_x    <= m7x_out;
-		ml_y    <= m7y_out;
-		ml_hofs <= m7hofs_out;
-		ml_vofs <= m7vofs_out;
-		ml_cap_idx    <= 3'd0;
-		ml_cap_active <= 1'b1;
-	end else if (ml_cap_active) begin
-		if (ml_cap_idx == 3'd7) begin
-			ml_cap_active <= 1'b0;
-			ml_line       <= ml_line + 8'd1;
-		end else begin
-			ml_cap_idx <= ml_cap_idx + 3'd1;
-		end
-	end
-end
+wire [31:1] ml_wraddr = M7_REGS_BASE[31:1] + {20'd0, ml_line, ml_idx};
 
-// Combinational BRAM port-A signals. Because these are derived from
-// registered values (ml_cap_idx etc.), the BRAM sees a stable address
-// and data at each posedge — no skew between them.
-assign m7_lb_wr_en   = ml_cap_active;
-assign m7_lb_wr_addr = {ml_line[7:0], ml_cap_idx};
-
+reg [15:0] ml_payload;
 always @(*) begin
-	case (ml_cap_idx)
-		3'd0: m7_lb_wr_data = ml_a;
-		3'd1: m7_lb_wr_data = ml_b;
-		3'd2: m7_lb_wr_data = ml_c;
-		3'd3: m7_lb_wr_data = ml_d;
-		3'd4: m7_lb_wr_data = {3'b000, ml_x};
-		3'd5: m7_lb_wr_data = {3'b000, ml_y};
-		3'd6: m7_lb_wr_data = {3'b000, ml_hofs};
-		3'd7: m7_lb_wr_data = {3'b000, ml_vofs};
-		default: m7_lb_wr_data = 16'd0;
-	endcase
+    case (ml_idx)
+        3'd0: ml_payload = ml_a;
+        3'd1: ml_payload = ml_b;
+        3'd2: ml_payload = ml_c;
+        3'd3: ml_payload = ml_d;
+        3'd4: ml_payload = {3'b000, ml_x};
+        3'd5: ml_payload = {3'b000, ml_y};
+        3'd6: ml_payload = {3'b000, ml_hofs};
+        default: ml_payload = {3'b000, ml_vofs};
+    endcase
 end
 
-// --- Copy state machine ---
-typedef enum reg [2:0] {
-	CS_IDLE,     // wait for FRAME_OUT
-	CS_ML_DUMP,  // per-line mailbox: set BRAM read addr
-	CS_ML_DATA,  // per-line mailbox: BRAM valid → DDR3 write
-	CS_CHK,      // check dirty, advance to next region or start copy
-	CS_ADDR,     // assert shadow read address
-	CS_WR,       // shadow data valid → issue DDR3 write
-	CS_NEXT      // wait for ack, increment index or advance region
-} copy_state_t;
-
-copy_state_t copy_state = CS_IDLE;
-reg [15:0] copy_idx;
-reg [1:0]  copy_region; // 0 = VRAM1, 1 = VRAM2, 2 = CGRAM
-
+// Scanline-start detector: raw H_CNT wrap from end-of-line back to 0.
+reg  start_of_scanline;
+reg  [8:0] ppu_x_prev;
 always @(posedge clk_sys) begin
-	case (copy_state)
-		CS_IDLE: begin
-			if (frame_out) begin
-				copy_idx    <= 16'd0;
-				cgram_dirty <= 1'b1;
-				copy_state  <= CS_ML_DUMP;
-			end
-		end
+    ppu_x_prev        <= ppu_x;
+    start_of_scanline <= (ppu_x == 9'd0) && (ppu_x_prev != 9'd0);
+    vbl_d             <= vblank_out;
+end
 
-		CS_ML_DUMP: begin
-			// Set BRAM read address for this entry; data valid next cycle.
-			if (mb_we_req == mb_we_ack) begin
-				m7_lb_rd_addr <= copy_idx[10:0];
-				copy_state    <= CS_ML_DATA;
-			end
-		end
+// --- VRAM write-through FIFO ---------------------------------------------
+// Snoops the CPU write ports (port A of vram1/vram2). In v1 each entry was
+// one 16-bit DDR3 write; in v2 the entries have no consumer yet (P2c packs
+// them into UART delta messages) but the snoop already runs in its final
+// shape so the versions/drop accounting is live.
+reg [23:0] wt_fifo [0:7];
+reg [3:0]  wt_w = 4'd0, wt_r = 4'd0;
+wire [3:0] wt_cnt = wt_w - wt_r;
 
-		CS_ML_DATA: begin
-			// BRAM data is valid now — write it to DDR3.
-			if (mb_we_req == mb_we_ack) begin
-				mb_wraddr <= MB_BASE_ADDR + {19'd0, copy_idx[10:0]};
-				mb_din    <= m7_lb_rd_data;
-				mb_we_req <= ~mb_we_req;
-				if (copy_idx == ML_ENTRY_COUNT - 1) begin
-					copy_idx    <= 16'd0;
-					copy_region <= 2'd0;
-					copy_state  <= CS_CHK;
-				end else begin
-					copy_idx   <= copy_idx + 16'd1;
-					copy_state <= CS_ML_DUMP;
-				end
-			end
-		end
+// ===========================================================================
+// One clk_sys always block owns all M7 engine state: per-line register
+// capture, the frame controller, and the write-through snoop. Single
+// ownership means every register is written from exactly one place.
+//
+// PIVOT v2: the 16-bit write service FSM (write-through / per-line mailbox /
+// header / CGRAM / resync-dump writers) is gone with the DDR3 mailbox port.
+// The per-line capture below latches the 8 Mode 7 registers at every
+// scanline start; P2c packs them into the UART stream. The frame controller
+// polls the daemon's ctrl word and adopts published frames.
+// ===========================================================================
+always @(posedge clk_sys) begin
+    // ---- per-line capture: latch the 8 registers at scanline start ------
+    if (frame_start)
+        ml_line <= 8'd0;
+    else if (start_of_scanline && !ml_run && ml_line < M7_LINE_COUNT[7:0]) begin
+        ml_a    <= m7a_out;
+        ml_b    <= m7b_out;
+        ml_c    <= m7c_out;
+        ml_d    <= m7d_out;
+        ml_x    <= m7x_out;
+        ml_y    <= m7y_out;
+        ml_hofs <= m7hofs_out;
+        ml_vofs <= m7vofs_out;
+        ml_idx  <= 3'd0;
+        ml_run  <= 1'b1;
+    end
+    // Capture drain (one word/cycle — the whole 8-reg set fits in a
+    // fraction of a scanline; the v1 FSM advanced it via MB_ML writes).
+    else if (ml_run) begin
+        if (ml_idx == 3'd7) begin
+            ml_run  <= 1'b0;
+            ml_line <= ml_line + 8'd1;
+        end else
+            ml_idx <= ml_idx + 3'd1;
+    end
 
-		CS_CHK: begin
-			case (copy_region)
-				2'd0: if (vram1_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
-				      else copy_region <= 2'd1;
-				2'd1: if (vram2_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
-				      else copy_region <= 2'd2;
-				2'd2: if (cgram_dirty) begin copy_idx <= 0; copy_state <= CS_ADDR; end
-				      else copy_state  <= CS_IDLE;
-				default: copy_state <= CS_IDLE;
-			endcase
-		end
+    // ---- frame controller ------------------------------------------------
+    ctrl_done_s1 <= ctrl_done;
+    ctrl_done_s2 <= ctrl_done_s1;
+    ctrl_done_s3 <= ctrl_done_s2;
 
-		CS_ADDR: begin
-			// Assert shadow read address; data will be valid next cycle.
-			case (copy_region)
-				2'd0, 2'd1: vram_mirror_addr <= copy_idx[13:0];
-				2'd2:       cgram_mirror_addr <= copy_idx[7:0];
-			endcase
-			copy_state <= CS_WR;
-		end
+    if (m7_frame_evt) begin
+        frame_seq <= frame_seq + 16'd1;
+        ctrl_req  <= ~ctrl_req;   // issue this frame's ctrl poll
+        fs_cnt    <= fs_cnt + 16'd1;
+    end
+    // Adopt the daemon's published frame when its poll result lands — react
+    // to ctrl_new directly. (v2.1 evaluated this branch inside the
+    // m7_frame_evt gate: the poll is ISSUED at the frame event and its DOUT
+    // lands many cycles later, so ctrl_new can never coincide with
+    // m7_frame_evt. Telemetry showed polls completing every frame with the
+    // exact published word while daemon_present stayed 0 — the branch was
+    // unreachable by construction.) Bits [31:17] are reserved-zero in the
+    // ABI — requiring them zero rejects random boot-time DDR3 garbage in
+    // the no-daemon-yet window (a false adoption would set daemon_present
+    // and fetch garbage with nobody publishing).
+    //
+    // fetch_restart is a one-clk_sys pulse OWNED by this block (the fetch
+    // FSM only reads it — a second driver there is an elaboration error).
+    // Clear-before-set order means a set in the adoption branch below wins
+    // for the current cycle.
+    if (fetch_restart)
+        fetch_restart <= 1'b0;
+    if (ctrl_new && (m7_ctrl_data[31:17] == 15'd0) &&
+        (m7_ctrl_data[15:0] != last_ready_seq)) begin
+        daemon_present <= 1'b1;
+        cur_buf        <= m7_ctrl_data[M7_CTRL_READY_BUF];
+        last_ready_seq <= m7_ctrl_data[15:0];
+        fetch_restart  <= 1'b1;
+    end
+    if (ctrl_new) cdn_cnt <= cdn_cnt + 16'd1;
 
-		CS_WR: begin
-			// Shadow data is valid now. Issue the DDR3 write.
-			if (mb_we_req == mb_we_ack) begin
-				case (copy_region)
-					2'd0: begin
-						mb_wraddr <= VRAM1_DDR3_BASE + {16'd0, copy_idx[13:0]};
-						mb_din    <= {8'd0, vram1_mirror_q};
-					end
-					2'd1: begin
-						mb_wraddr <= VRAM2_DDR3_BASE + {16'd0, copy_idx[13:0]};
-						mb_din    <= {8'd0, vram2_mirror_q};
-					end
-					2'd2: begin
-						mb_wraddr <= CGRAM_DDR3_BASE + {23'd0, copy_idx[7:0]};
-						mb_din    <= cgram_mirror_q;
-					end
-				endcase
-				mb_we_req   <= ~mb_we_req;
-				copy_state  <= CS_NEXT;
-			end
-		end
-
-		CS_NEXT: begin
-			if (mb_we_req == mb_we_ack) begin
-				case (copy_region)
-					2'd0: if (copy_idx == 16'd16383) begin
-							vram1_dirty <= 1'b0;
-							copy_region <= 2'd1;
-							copy_idx    <= 16'd0;
-							copy_state  <= CS_CHK;
-						  end else begin
-							copy_idx   <= copy_idx + 16'd1;
-							copy_state <= CS_ADDR;
-						  end
-					2'd1: if (copy_idx == 16'd16383) begin
-							vram2_dirty <= 1'b0;
-							copy_region <= 2'd2;
-							copy_idx    <= 16'd0;
-							copy_state  <= CS_CHK;
-						  end else begin
-							copy_idx   <= copy_idx + 16'd1;
-							copy_state <= CS_ADDR;
-						  end
-					2'd2: if (copy_idx == 16'd255) begin
-							cgram_dirty <= 1'b0;
-							copy_state  <= CS_IDLE;
-						  end else begin
-							copy_idx   <= copy_idx + 16'd1;
-							copy_state <= CS_ADDR;
-						  end
-				endcase
-			end
-		end
-	endcase
-
-	// Dirty-flag detection. Placed AFTER the case statement so that a
-	// VRAM write detected on the same cycle as a clear wins (last
-	// non-blocking assignment wins). This guarantees we never miss a
-	// write that happens exactly when the copy finishes.
-	if (~VRAM1_WE_N) vram1_dirty <= 1'b1;
-	if (~VRAM2_WE_N) vram2_dirty <= 1'b1;
+    // ---- VRAM write-through snoop (last: same-cycle writes never lost) ----
+    if (~VRAM1_WE_N) begin
+        if (wt_cnt < 4'd8) begin
+            wt_fifo[wt_w[2:0]] <= {1'b0, VRAM1_ADDR[14:0], VRAM1_D};
+            wt_w      <= wt_w + 4'd1;
+            vram1_ver <= vram1_ver + 16'd1;
+        end else if (wt_drops != 16'hFFFF)
+            wt_drops <= wt_drops + 16'd1;
+    end
+    if (~VRAM2_WE_N) begin
+        if (wt_cnt < 4'd8) begin
+            wt_fifo[wt_w[2:0]] <= {1'b1, VRAM2_ADDR[14:0], VRAM2_D};
+            wt_w      <= wt_w + 4'd1;
+            vram2_ver <= vram2_ver + 16'd1;
+        end else if (wt_drops != 16'hFFFF)
+            wt_drops <= wt_drops + 16'd1;
+    end
 end
 `endif
 
@@ -1948,40 +1916,58 @@ msu_data_store msu_data_store
 	.rd_dout(msu_data)
 );
 
+// ---------------------------------------------------------------------------
+// ddram: the DDR3 f2sdram port-1 client FSM, wired DIRECTLY to the module's
+// DDRAM_* ports (upstream topology — the traffic-cop mux layer is gone).
+//
+// Clients, in the FSM's arbitration order:
+//   rom   — savestates (reads+writes, burst-1)
+//   rd2   — MSU-1 data RAM (burst-2)
+//   hd    — HD Mode 7 scanline fetch (burst-1 reads, lowest priority)
+//
+// PIVOT v2 (2026-10-12): the 16-bit mailbox WRITE port is deleted. f2sdram
+// port-1 FPGA writes are broken on this device at every usable clock
+// (accepted/acked but never committed — proven at clk_mem across three
+// deterministic placements and at clk_sys with a healthy arbiter), so the
+// ONLY writer to the Mode 7 DDR3 window is the ARM daemon (proven perfect);
+// FPGA->ARM control data rides the HPS UART instead (rtl/m7_reg_stream.sv).
+// Port clock: clk_sys (assign below) — reads proven perfect there twice.
+// ---------------------------------------------------------------------------
+wire [1:0] dbg_ddr_state;   // production: dangling (debug builds decoded it)
+
 ddram ddram
 (
 	.DDRAM_CLK(DDRAM_CLK),
 
-	.DDRAM_ADDR(cache_DDRAM_ADDR),
-	.DDRAM_DOUT(cache_DDRAM_DOUT),
-	.DDRAM_RD(cache_DDRAM_RD),
-	.DDRAM_WE(cache_DDRAM_WE),
-	.DDRAM_DIN(cache_DDRAM_DIN),
-	.DDRAM_BURSTCNT(cache_DDRAM_BURSTCNT),
-	.DDRAM_DOUT_READY(cache_DDRAM_DOUT_READY),
-	.DDRAM_BUSY(cache_DDRAM_BUSY),
+	.DDRAM_ADDR(DDRAM_ADDR),
+	.DDRAM_DOUT(DDRAM_DOUT),
+	.DDRAM_RD(DDRAM_RD),
+	.DDRAM_WE(DDRAM_WE),
+	.DDRAM_DIN(DDRAM_DIN),
+	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
+	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
+	.DDRAM_BUSY(DDRAM_BUSY),
 
 	.cache_rst(~RESET_N),
 
-	// Phase 4 Task 4.1: M7 register mailbox writer drives the previously
-	// unused 16-bit write port.
-	.wraddr(mb_wraddr),
-	.din(mb_din),
-	.we_req(mb_we_req),
-	.we_ack(mb_we_ack),
-
 	.rdaddr({11'b0011_1111_10, ss_ddr_addr[21:3]}), // Save states at $3F80.0000
-	.dout(ss_ddr_dout),
 	.rom_din(ss_ddr_din),
 	.rom_be(ss_ddr_be),
 	.rom_we(ss_ddr_we),
+	.dout(ss_ddr_dout),
 	.rom_req(ss_ddr_req),
 	.rom_ack(ss_ddr_ack),
 
 	.rdaddr2(msu_ram_addr), // MSU is at $2060.0000-3F7F.FFFF
 	.dout2(msu_ram_dout),
 	.rd_req2(msu_ram_req),
-	.rd_ack2(msu_ram_ack)
+	.rd_ack2(msu_ram_ack),
+
+	.hd_addr(dm_addr),
+	.hd_req(dm_req),
+	.hd_ack(dm_ack),
+	.hd_dout(dm_dout),
+	.dbg_state(dbg_ddr_state)
 );
 
 
@@ -2016,146 +2002,102 @@ savestate_ui #(.INFO_TIMEOUT_BITS(25)) savestate_ui
 	.selected_slot  (ss_slot       )
 );
 // ===========================================================================
-// DDR3 Shared Memory Arbiter
-// Routes physical RAM access between the Cache (MSU-1/SaveStates) and Mode 7 DMA
+// The DDR3 traffic cop is GONE (PIVOT v2, 2026-10-12). With the mailbox
+// write port deleted there is exactly one FPGA-side DDR3 bus master left —
+// the ddram FSM itself — so there is nothing left to arbitrate at this
+// level: ddram's internal state-0 priority (savestate > MSU-1 > HD fetch)
+// is the whole arbiter, every client is a level req/ack handshake, and the
+// HD fetch client simply waits its turn (its deadlines are soft: a line
+// that isn't ready falls back to native output).
 // ===========================================================================
-wire        cache_DDRAM_RD;
-wire        cache_DDRAM_WE;
-wire [28:0] cache_DDRAM_ADDR;
-wire [63:0] cache_DDRAM_DIN;
-wire [7:0]  cache_DDRAM_BE;
-wire [7:0]  cache_DDRAM_BURSTCNT;
-reg  [63:0] cache_DDRAM_DOUT;
-reg         cache_DDRAM_DOUT_READY;
-reg         cache_DDRAM_BUSY;
-
-reg         dma_DDRAM_RD;
-reg  [28:0] dma_DDRAM_ADDR;
-reg  [63:0] dma_DDRAM_DOUT;
-reg         dma_DDRAM_DOUT_READY;
-reg         dma_DDRAM_BUSY;
-
-`ifndef M7_2X_ENABLE
-always @(*) begin
-    dma_DDRAM_RD = 1'b0;
-    dma_DDRAM_ADDR = 29'd0;
-end
-`endif
-
-// Traffic cop state (0 = Cache active, 1 = DMA active)
-reg active_client = 1'b0; 
-
-// Phase B5: round-robin fairness. Previously DMA had absolute priority
-// whenever dma_DDRAM_RD pulsed, which runs every scanline (~15.7 kHz) and
-// starved the cache path (MSU-1 audio, save states). Now when the bus is
-// free and BOTH clients want it, we alternate based on who was served
-// last. Single-requestor cases still get immediate service.
-wire cache_wants = (cache_DDRAM_RD || cache_DDRAM_WE);
-wire dma_wants   = dma_DDRAM_RD;
-
-reg transaction_pending = 1'b0;
-
-always @(posedge clk_sys) begin
-    cache_DDRAM_DOUT_READY <= 1'b0;
-    dma_DDRAM_DOUT_READY   <= 1'b0;
-
-    // Route the incoming data to whoever asked for it
-    if (DDRAM_DOUT_READY) begin
-        transaction_pending <= 1'b0;
-        if (active_client == 1'b1) begin
-            dma_DDRAM_DOUT <= DDRAM_DOUT;
-            dma_DDRAM_DOUT_READY <= 1'b1;
-        end else begin
-            cache_DDRAM_DOUT <= DDRAM_DOUT;
-            cache_DDRAM_DOUT_READY <= 1'b1;
-        end
-    end else if (DDRAM_RD && !DDRAM_BUSY) begin
-        transaction_pending <= 1'b1;
-    end
-
-    // When the bus is idle, pick the next client. Round-robin: if both
-    // want the bus, whoever was NOT the last active client wins.
-    if (!transaction_pending) begin
-        // Switch ONLY when the current transaction is fully complete.
-        // A write is complete immediately when accepted (!DDRAM_BUSY).
-        if ((active_client == 1'b1 && !dma_wants) || 
-            (active_client == 1'b0 && !cache_wants) || 
-            (DDRAM_WE && !DDRAM_BUSY)) begin
-            
-            if (active_client == 1'b1) begin
-                if (cache_wants) active_client <= 1'b0;
-            end else begin
-                if (dma_wants)   active_client <= 1'b1;
-            end
-        end
-    end else begin
-        // If a read is pending, we must wait until it returns.
-        // We can switch the cycle the data arrives to maintain throughput.
-        if (DDRAM_DOUT_READY) begin
-            if (active_client == 1'b1) begin
-                if (cache_wants) active_client <= 1'b0;
-            end else begin
-                if (dma_wants)   active_client <= 1'b1;
-            end
-        end
-    end
-end
-
-// Route physical outputs to the active client
-assign DDRAM_RD       = (active_client == 1'b1) ? dma_DDRAM_RD       : cache_DDRAM_RD;
-assign DDRAM_WE       = (active_client == 1'b1) ? 1'b0               : cache_DDRAM_WE;
-assign DDRAM_ADDR     = (active_client == 1'b1) ? dma_DDRAM_ADDR     : cache_DDRAM_ADDR;
-assign DDRAM_DIN      = (active_client == 1'b1) ? 64'd0              : cache_DDRAM_DIN;
-assign DDRAM_BE       = (active_client == 1'b1) ? 8'hFF              : cache_DDRAM_BE; 
-assign DDRAM_BURSTCNT = (active_client == 1'b1) ? 8'd1               : cache_DDRAM_BURSTCNT;
-
-// Route busy signals so the inactive client knows to wait its turn
-always @(*) begin
-    cache_DDRAM_BUSY = DDRAM_BUSY;
-    dma_DDRAM_BUSY   = DDRAM_BUSY;
-
-    if (active_client == 1'b1) cache_DDRAM_BUSY = 1'b1;
-    if (active_client == 1'b0 && (cache_DDRAM_RD || cache_DDRAM_WE)) dma_DDRAM_BUSY = 1'b1;
-end
 
 // ===========================================================================
 // Phase 2: HD Mode 7 DDR3 Memory Reader (DMA)
 // ===========================================================================
 
-// 1. Hardwire the MiSTer memory clock. The arbiter above drives all other
-//    physical DDRAM_* outputs (RD/WE/ADDR/DIN/BE/BURSTCNT) — do NOT reassign
-//    them here, or you will create multiple-driver compile errors.
+// Run the DDR3 controller port on the MiSTer memory clock. The arbiter above
+// drives all other physical DDRAM_* outputs (RD/WE/ADDR/DIN/BE/BURSTCNT) —
+// do NOT reassign them here, or you will create multiple-driver compile
+// errors.
+// f2sdram port 1 clock: upstream stock is clk_mem (upstream SNES.sv:1372,
+// ~4x clk_sys) — an earlier run of this repo drove it with clk_sys, which
+// PIVOT P1 (2026-10-12): clk_mem is now proven dead in our fits across THREE
+// independent deterministic placements (SEED 1/2/3 all wedge the f2sdram
+// port in read-wait with zero readdatavalid), so the port moves to clk_sys —
+// the NDS4MiSTer/GBA topology, where this build's reads were already proven
+// correct (Build-5 identity scan). History: the 2026-10-11 clk_sys build saw
+// the port's write path silently drop ALL writes (full or partial
+// byteenable — a full-BE write to a prepainted scratch never committed while
+// every handshake counter looked healthy), but that build still had the
+// pulse-based cop wedge — fixed since — so the verdict is confounded. The
+// probe+UART channel below now tests the one unproven combination:
+// full-BE FPGA WRITES at clk_sys with the fixed level-based cop. devmem
+// 0x3E200000 == 0x1234ABCD after load ⇒ writes commit ⇒ the all-DDR3
+// architecture works at clk_sys unchanged.
 assign DDRAM_CLK      = clk_sys;
 
 `ifdef M7_2X_ENABLE
-// 2. Memory Map Parameters
-//    The DMA reader bypasses the ddram module and drives DDRAM_ADDR
-//    directly. DDRAM_ADDR is a 64-bit WORD address: physical byte address
-//    = DDRAM_ADDR × 8. The daemon writes pixels at physical byte address
-//    0x3E002000, so the word-address base is 0x3E002000 >> 3 = 0x07C00400.
-//    Per-read advance is +1 word (= 8 bytes).
-localparam [28:0] DDR3_BASE_ADDR = 29'h07C00400;
+// HD pixel line fetch — runs on clk_sys (the DDR3 bus domain), CONTINUOUSLY.
+//
+// PIVOT v2 (2026-10-12): the fetch is no longer per-line-triggered. At
+// burst-1 (the only read shape proven on this device), one 64-bit word
+// costs its full transaction latency, so a 256-word row takes several
+// THOUSAND clk_sys cycles — far more than one scanline's 341. The fetch
+// therefore runs as a free-running background sequencer over rows
+// 0..223, and each row's completion sets a sticky done bit. At hde-fall
+// the arm decision looks up row_done[next_row]: a row that is ready gets
+// its HD line, one that isn't falls back to native output — no tearing,
+// just graceful per-line degradation. The done bits are cleared and the
+// sequencer restarts from row 0 whenever a new daemon frame is adopted,
+// so stale rows from an older frame are never re-shown as "fresh".
+//
+// Clients the ddram FSM serves ahead of us: savestates, MSU-1. Our level
+// handshake (hd_req/hd_ack toggles) simply waits its turn — lost pulses
+// are structurally impossible, which was the whole cop lesson.
+//
+// Address convention (rtl/m7_abi.svh): DDRAM_ADDR is a 64-bit WORD address
+// (physical byte >> 3); row r of the pixel buffer lives at word offset
+// r*256 from the buffer base, i.e. {r, fetch_word}.
+reg  ctrl_req_s1, ctrl_req_s2, ctrl_req_s3;
+wire ctrl_req_pulse = ctrl_req_s2 ^ ctrl_req_s3;
 
-// Phase 3 Task 3.5: HD_WIDTH is parameterized by m7_scale.
-// 1x=256, 2x=512, 3x=768, 4x=1024, 6x=1536.
-wire [10:0] HD_WIDTH       = m7_scale_wire * 11'd256;
-// C.4: pixels are 16-bit packed (RGB565), 4 pixels per 64-bit word.
-// Stride is in WORDS (not bytes): HD_WIDTH / 4.
-wire [15:0] HD_LINE_STRIDE = HD_WIDTH / 16'd4;
+reg        m7_fetch_en_s1, m7_fetch_en_s2;
+reg        cur_buf_s;
 
-// Phase 3 Task 3.1: scanline sync from PPU's raw H_CNT/V_CNT counters.
-wire [8:0]  current_scanline = ppu_y;
-reg         start_of_scanline;
-reg  [8:0]  ppu_x_prev;
+localparam DM_IDLE = 3'd0, DM_ROW_END = 3'd1, DM_CTRL_WAIT = 3'd2,
+           DM_WAIT  = 3'd4, DM_DRAIN  = 3'd5;   // (DM_CTRL/DM_REQ were dead)
+reg [2:0]  dm_state = DM_IDLE;
 
-// Phase 3 Task 3.2: linebuf write-port outputs. These are the SOLE drivers
-// of the buf_wr_* wires — hps_ext has been disconnected (Phase 3.6).
-reg  [10:0] buf_wr_addr;
-reg  [23:0] buf_wr_data;
+// linebuf write-port outputs. These are the SOLE drivers of the buf_wr_*
+// wires — hps_ext has been disconnected.
+reg  [8:0]  buf_wr_addr;    // pixel PAIR index within the line (512 pairs)
+reg  [31:0] buf_wr_data;    // two RAW RGB565 pixels (linebuf expands to 888)
 reg         buf_wr_en;
-reg         buf_arm;
+reg         ctrl_pend = 1'b0;   // ctrl poll request latch (sweep-starve fix)
+reg  [7:0]  last_row_id = 8'd0; // row id sitting complete in the inactive slot
+reg [14:0]  park_cnt;           // DM_ROW_END safety counter
 
-// RGB565 -> RGB888 expansion (matches the formula in hps_ext.v).
+// ddram HD client handshake (level req/ack toggles)
+reg  [28:0] dm_addr;
+reg         dm_req  = 1'b0;
+wire        dm_ack;
+wire [63:0] dm_dout;
+
+reg  [8:0]  fetch_row  = 9'd0;   // row currently being fetched (0..223)
+reg  [7:0]  fetch_word = 8'd0;   // 64-bit word within the row (0..255)
+reg  [63:0] dm_word;              // latched read (stable through DM_DRAIN)
+reg  [3:0]  px_pair;
+reg  [255:0] row_done = 256'd0;  // sticky: row ready for display
+reg         fetch_restart = 1'b0;    // frame controller: new frame adopted
+reg         fetch_pend = 1'b0;   // restart waiting for the bus to go idle
+
+// Watchdog: a fetch word that hasn't returned in 8192 clk_sys (~380 µs)
+// aborts the FSM so a dead port degrades to "no HD lines" instead of
+// hanging the sequencer. Counted only while a transaction is in flight.
+reg  [12:0] dm_watchdog = 13'd0;
+reg         dm_wd_evt   = 1'b0;  // sticky for the LED panel
+
+// RGB565 -> RGB888 expansion.
 function [23:0] rgb565_to_888;
     input [15:0] in;
     begin
@@ -2165,102 +2107,292 @@ function [23:0] rgb565_to_888;
     end
 endfunction
 
-// Scanline-start detector: raw H_CNT wrapping from end-of-line back to 0.
-always @(posedge clk_sys) begin
-    ppu_x_prev       <= ppu_x;
-    start_of_scanline <= (ppu_x == 9'd0) && (ppu_x_prev != 9'd0);
-end
-
-// 3. State Machine Setup
-// C.4 optimization: extract 4 pixels per 64-bit DDR3 read (the daemon
-// packs consecutive RGB565 values at 16-bit granularity). This halves
-// the number of DDR3 reads per scanline vs the previous 2-pixel design.
-typedef enum bit [2:0] {
-    STATE_IDLE,
-    STATE_REQ,
-    STATE_WAIT,
-    STATE_PUSH_P1,
-    STATE_PUSH_P2,
-    STATE_PUSH_P3,
-    STATE_PUSH_P4
-} dma_state_t;
-
-dma_state_t dma_state = STATE_IDLE;
-
-reg [28:0] current_read_addr;
-reg [10:0] pixels_fetched;
-reg [63:0] cached_64bit_data;
+wire [28:0] dm_word_addr = (cur_buf_s ? M7_PIXBUF_B_WORD : M7_PIXBUF_WORD)
+                           + {fetch_row, fetch_word};
 
 always @(posedge clk_sys) begin
-    // Default pulses
-    dma_DDRAM_RD <= 1'b0;
-    buf_wr_en    <= 1'b0;
-    buf_arm      <= 1'b0;
+    // 3FF synchronisers for the frame-controller toggles/quasi-static
+    // payload (same domain today — kept so the FSM stays correct if the
+    // port clock ever changes back to a multi-domain topology).
+    ctrl_req_s1 <= ctrl_req;      ctrl_req_s2  <= ctrl_req_s1; ctrl_req_s3 <= ctrl_req_s2;
+    m7_fetch_en_s1 <= m7_fetch_en; m7_fetch_en_s2 <= m7_fetch_en_s1;
+    cur_buf_s   <= cur_buf;       // quasi-static (changes once per frame)
 
-    case (dma_state)
-        STATE_IDLE: begin
-            if (start_of_scanline && m7_scale_wire != 4'd0) begin
-                current_read_addr <= DDR3_BASE_ADDR + (HD_LINE_STRIDE * current_scanline);
-                pixels_fetched    <= 11'd0;
-                dma_state         <= STATE_REQ;
+    buf_wr_en <= 1'b0;
+
+    // Ctrl-poll request latch: the sweep keeps dm_req!=dm_ack most cycles,
+    // so the 1-cycle ctrl_req_pulse used to be missed ~95% of the time
+    // (first telemetry capture: 160 of 3129 polls completed). Latch it;
+    // the IDLE ctrl branch below drains the latch with priority over fetch
+    // words. Same-block ordering makes the IDLE clear win when both fire.
+    if (ctrl_req_pulse)
+        ctrl_pend <= 1'b1;
+
+    // Watchdog: counts while a read is outstanding; abort wins over the
+    // case below only if no completion lands this cycle.
+    if ((dm_state == DM_CTRL_WAIT || dm_state == DM_WAIT) && (dm_req != dm_ack))
+        dm_watchdog <= dm_watchdog + 13'd1;
+    else
+        dm_watchdog <= 13'd0;
+
+    // While a restart is pending the FSM must not issue anything: an
+    // in-flight read completes on its own (ddram toggles dm_ack unaided)
+    // and the pend block below lands the reset at a genuinely idle point.
+    if (!fetch_pend)
+    case (dm_state)
+        DM_IDLE: begin
+            // dm_req == dm_ack gate: after a watchdog abort the old
+            // transaction may still be outstanding — issuing before its
+            // late ack lands would make ddram treat our new toggle as the
+            // old read's completion (stale data, swallowed request).
+            if ((dm_req == dm_ack) && (ctrl_req_pulse || ctrl_pend)) begin
+                dm_addr   <= M7_CTRL_WORD;
+                dm_req    <= ~dm_req;
+                dm_state  <= DM_CTRL_WAIT;
+                ctrl_pend <= 1'b0;
+            end else if ((dm_req == dm_ack) && m7_fetch_en_s2) begin
+                dm_addr  <= dm_word_addr;
+                dm_req   <= ~dm_req;
+                dm_state <= DM_WAIT;
             end
         end
 
-        STATE_REQ: begin
-            if (!dma_DDRAM_BUSY) begin
-                dma_DDRAM_ADDR <= current_read_addr;
-                dma_DDRAM_RD   <= 1'b1;
-                dma_state      <= STATE_WAIT;
+        DM_CTRL_WAIT: begin
+            if (dm_watchdog == 13'h1FFF) begin
+                dm_wd_evt <= 1'b1;
+                dm_state  <= DM_IDLE;
+            end else if (dm_req == dm_ack) begin
+                m7_ctrl_data <= dm_dout;
+                ctrl_done    <= ~ctrl_done;
+                dm_state     <= DM_IDLE;
             end
         end
 
-        STATE_WAIT: begin
-            if (dma_DDRAM_DOUT_READY) begin
-                cached_64bit_data <= dma_DDRAM_DOUT;
-                dma_state         <= STATE_PUSH_P1;
+        DM_WAIT: begin
+            if (dm_watchdog == 13'h1FFF) begin
+                dm_wd_evt <= 1'b1;
+                dm_state  <= DM_IDLE;
+            end else if (dm_req == dm_ack) begin
+                dm_word  <= dm_dout;
+                px_pair  <= 4'd0;
+                drt_cnt  <= drt_cnt + 16'd1;   // telemetry: fetch words done
+                dm_state <= DM_DRAIN;
             end
         end
 
-        STATE_PUSH_P1: begin
-            buf_wr_addr <= pixels_fetched;
-            buf_wr_data <= rgb565_to_888(cached_64bit_data[15:0]);
-            buf_wr_en   <= 1'b1;
-            dma_state   <= STATE_PUSH_P2;
-        end
-
-        STATE_PUSH_P2: begin
-            buf_wr_addr <= pixels_fetched + 11'd1;
-            buf_wr_data <= rgb565_to_888(cached_64bit_data[31:16]);
-            buf_wr_en   <= 1'b1;
-            dma_state   <= STATE_PUSH_P3;
-        end
-
-        STATE_PUSH_P3: begin
-            buf_wr_addr <= pixels_fetched + 11'd2;
-            buf_wr_data <= rgb565_to_888(cached_64bit_data[47:32]);
-            buf_wr_en   <= 1'b1;
-            dma_state   <= STATE_PUSH_P4;
-        end
-
-        STATE_PUSH_P4: begin
-            buf_wr_addr <= pixels_fetched + 11'd3;
-            buf_wr_data <= rgb565_to_888(cached_64bit_data[63:48]);
-            buf_wr_en   <= 1'b1;
-
-            pixels_fetched    <= pixels_fetched + 11'd4;
-            current_read_addr <= current_read_addr + 29'd1; // next 64-bit word
-
-            // pixels_fetched is the value BEFORE the increment, so test
-            // against HD_WIDTH-4.
-            if (pixels_fetched >= (HD_WIDTH - 11'd4)) begin
-                dma_state <= STATE_IDLE;
-                buf_arm   <= 1'b1;
-            end else begin
-                dma_state <= STATE_REQ;
+        // Push the word's 4 RGB565 pixels as two RAW pairs into the linebuf
+        // (32-bit port: 2 pixels/cycle; the linebuf expands 565->888 at
+        // read). The daemon packs RGB565 at 16-bit granularity,
+        // little-endian halfwords in the 64-bit word.
+        DM_DRAIN: begin
+            buf_wr_addr <= {fetch_word, px_pair[0]};
+            buf_wr_data <= (px_pair[0] == 1'b0)
+                ? {dm_word[31:16], dm_word[15:0]}
+                : {dm_word[63:48], dm_word[47:32]};
+            buf_wr_en <= 1'b1;
+            px_pair   <= px_pair + 4'd1;
+            if (px_pair[0]) begin
+                if (fetch_word == 8'd255) begin
+                    row_done[fetch_row] <= 1'b1;
+                    last_row_id <= fetch_row[7:0];
+                    fetch_word <= 8'd0;
+                    fetch_row  <= (fetch_row == 9'd223) ? 9'd0 : fetch_row + 9'd1;
+                    park_cnt   <= 15'd0;
+                    // Row complete: park until the display side consumes
+                    // the boundary (row_adv, pulsed at the next hde fall).
+                    // This keeps the linebuf slot swap atomic — the writer
+                    // can never straddle one mid-row — and rate-limits the
+                    // sweep to the display pace. Safety counter un-wedges
+                    // a park with no hde falls (video gone).
+                    dm_state <= DM_ROW_END;
+                end else begin
+                    fetch_word <= fetch_word + 8'd1;
+                    dm_state <= DM_IDLE;
+                end
             end
+        end
+
+        DM_ROW_END: begin
+            park_cnt <= park_cnt + 15'd1;
+            if (row_adv || (&park_cnt))
+                dm_state <= DM_IDLE;
         end
     endcase
+
+    // New daemon frame adopted: restart the sweep from row 0 with clean
+    // done bits (the frame controller sets this pulse at adoption time).
+    // The reset WAITS for an idle bus — dropping the FSM out of DM_WAIT
+    // with a transaction outstanding would misattribute the old read's ack
+    // to the next issue (stale word + swallowed request), and dropping out
+    // of DM_DRAIN would write the word's second pair to the wrong
+    // row/word (fetch_row/fetch_word reset before the write fires).
+    // Worst cost of waiting: one word of the old sweep still lands in the
+    // linebuf, refetched anyway next sweep.
+    if (fetch_restart) begin          // one-cycle pulse from the frame ctrl
+        fetch_pend <= 1'b1;
+    end else if (fetch_pend) begin
+        if (dm_watchdog == 13'h1FFF) begin
+            // port died mid-flight while pending — abort visibly
+            dm_wd_evt  <= 1'b1;
+            fetch_pend <= 1'b0;
+            dm_state   <= DM_IDLE;
+            fetch_row  <= 9'd0;
+            fetch_word <= 8'd0;
+            px_pair    <= 4'd0;
+            row_done   <= 256'd0;
+        end else if (dm_req == dm_ack) begin
+            fetch_pend <= 1'b0;
+            dm_state   <= DM_IDLE;   // covers DM_WAIT whose ack just landed
+            fetch_row  <= 9'd0;
+            fetch_word <= 8'd0;
+            px_pair    <= 4'd0;
+            row_done   <= 256'd0;
+        end
+    end
 end
+
+// --- Line arm decision (clk_sys) ------------------------------------------
+// hde falling edge ends line L's active video. V_CNT has not incremented
+// yet at that edge, so the row displayed by line L+1 is ppu_y+1. Arm the
+// linebuf only if that row's fetch has completed (sticky row_done) —
+// otherwise the line falls back to native output.
+reg        hde_d;
+reg        m7_line_hd = 1'b0;
+reg        row_adv = 1'b0;          // one-clk pulse: fetch FSM may leave park
+reg  [7:0] disp_row = 8'hFF;        // row id currently in the displayed slot
+                                    // (act itself is declared by the instance)
+
+// hde_cnt/arm_cnt reset at each frame_start: arm_cnt = lines that showed
+// the HD buffer this frame — the fetch-throughput measurement.
+//
+// Slot swap policy (v3): at each hde fall, if this line's row was fetched
+// and the inactive slot holds a COMPLETED row the display hasn't shown
+// yet, swap slots. The parked writer (DM_ROW_END) guarantees the swap is
+// atomic; lines between fresh rows repeat the displayed row. row_adv
+// releases the parked FSM at the same edge so the next row starts into
+// the slot that just became inactive.
+always @(posedge clk_sys) begin
+    hde_d <= HBlank_out;
+    row_adv <= 1'b0;
+    if (frame_start) begin
+        hde_cnt <= 16'd0;
+        arm_cnt <= 16'd0;
+    end else if (~HBlank_out & hde_d) begin
+        hde_cnt <= hde_cnt + 16'd1;
+        row_adv <= (dm_state == DM_ROW_END);
+        if (m7_fetch_en && (ppu_y < 9'd223)) begin
+            if (row_done[ppu_y + 9'd1]) begin
+                arm_cnt <= arm_cnt + 16'd1;
+                if (last_row_id != disp_row) begin
+                    act      <= ~act;
+                    disp_row <= last_row_id;
+                end
+            end
+            m7_line_hd <= row_done[ppu_y + 9'd1];
+        end else
+            m7_line_hd <= 1'b0;
+    end
+end
+`endif
+
+// ===========================================================================
+// M7 LED panel: mirrors the HD fetch path onto the DE10-Nano's 8 user LEDs.
+//   LED0  heartbeat (blinks ~1.3 Hz)   — clk_sys + this block alive
+//   LED1  fetch FSM off IDLE (live)    — the fetch sequencer is mid-word
+//   LED2  fetch word COMPLETED win.    — dm_ack toggling (words landing)
+//   LED3  DDRAM_BUSY live level        — solid = f2sdram waitrequest stuck
+//   LED4  fetch watchdog fired (latch) — a fetch word timed out
+//   LED5  daemon_present               — a ctrl frame was adopted
+//   LED6  WT FIFO full (live)          — VRAM write-through flood (P2c consumer)
+//   LED7  read data EVER landed        — any DOUT_READY since load
+// "Window" LEDs latch activity and clear every ~0.78 s, so they blink at
+// any event rate above ~2 Hz.
+// ===========================================================================
+`ifdef M7_2X_ENABLE
+reg [23:0] dbg_led_t   = 24'd0;
+reg        dbg_ack_seen = 1'b0, dbg_rd_latch = 1'b0;
+reg        dm_ack_q     = 1'b0;
+
+always @(posedge clk_sys) begin
+    dbg_led_t <= dbg_led_t + 24'd1;
+    dm_ack_q  <= dm_ack;
+    if (dm_ack != dm_ack_q)   dbg_ack_seen <= 1'b1;
+    if (DDRAM_DOUT_READY)     dbg_rd_latch <= 1'b1;
+    if (&dbg_led_t) dbg_ack_seen <= 1'b0;
+end
+
+assign M7_DBG_LED = { dbg_rd_latch,                 // [7]
+                      (wt_cnt == 4'd8),             // [6]
+                      daemon_present,               // [5]
+                      dm_wd_evt,                    // [4]
+                      DDRAM_BUSY,                   // [3]
+                      dbg_ack_seen,                 // [2]
+                      (dm_state != DM_IDLE),        // [1]
+                      dbg_led_t[23] };              // [0]
+
+// ---------------------------------------------------------------------------
+// FPGA->ARM register stream (PIVOT v2): owns ttyS1. The f2sdram write path
+// is broken on this device at every usable clock, so control data flows to
+// the daemon over the HPS UART instead (rtl/m7_reg_stream.sv). P2b runs it
+// in TELEMETRY mode (test_mode=2): each frame is a snapshot of every link
+// in the ctrl->adoption->fetch->arm chain — the on-screen test card AND
+// the debug channel in one build. Decode: scripts/m7_telemetry_decode.py.
+// ---------------------------------------------------------------------------
+// DOUT_READY rising counter — its own block (nobody else samples the port).
+reg dout_d = 1'b0;
+always @(posedge clk_sys) begin
+    dout_d <= DDRAM_DOUT_READY;
+    if (DDRAM_DOUT_READY & ~dout_d) dout_cnt <= dout_cnt + 16'd1;
+end
+
+wire [2047:0] dbg_bytes;
+assign dbg_bytes[7:0]     = 8'hC3;                    // [0] magic
+assign dbg_bytes[15:8]    = {fetch_pend, fetch_restart, m7_fetch_en,
+                             daemon_present, dm_wd_evt, DDRAM_BUSY,
+                             DDRAM_DOUT_READY, (dm_req != dm_ack)}; // [1]
+assign dbg_bytes[23:16]   = {vblank_out, HBlank_out, 2'b00, ctrl_new,
+                             dm_state};               // [2]
+assign dbg_bytes[31:24]   = {m7_line_hd, cur_buf_s, cur_buf, fetch_pend,
+                             4'b0000};                // [3]
+assign dbg_bytes[255:32]  = row_done[223:0];          // [4..31] sticky rows
+assign dbg_bytes[271:256] = fs_cnt;                   // [32..33]
+assign dbg_bytes[287:272] = cdn_cnt;                  // [34..35] ctrl polls OK
+assign dbg_bytes[303:288] = drt_cnt;                  // [36..37] fetch words
+assign dbg_bytes[319:304] = dout_cnt;                 // [38..39] DOUT edges
+assign dbg_bytes[335:320] = hde_cnt;                  // [40..41] hde falls/frame
+assign dbg_bytes[351:336] = arm_cnt;                  // [42..43] HD lines/frame
+assign dbg_bytes[367:352] = {7'd0, fetch_row};        // [44..45] (7+9=16)
+assign dbg_bytes[383:368] = {8'd0, fetch_word};       // [46..47]
+assign dbg_bytes[415:384] = m7_ctrl_data;             // [48..51] LAST CTRL READ
+assign dbg_bytes[447:416] = dm_word[31:0];            // [52..55] last word
+assign dbg_bytes[463:448] = {7'd0, ppu_x};            // [56..57]
+assign dbg_bytes[479:464] = {7'd0, ppu_y};            // [58..59]
+assign dbg_bytes[495:480] = last_ready_seq;           // [60..61]
+assign dbg_bytes[1031:1024] = disp_row;               // [128] displayed row
+assign dbg_bytes[1039:1032] = last_row_id;            // [129] inactive-slot row
+assign dbg_bytes[1047:1040] = {row_adv, act, 6'b0};   // [130] swap activity
+assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
+assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
+assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
+assign dbg_bytes[2047:1048] = {125{32'hAAAA_AAAA}};   // filler (bytes 131..255)
+
+wire m7_stream_txd;
+m7_reg_stream #(
+	.CLK_HZ      (32'd21_477_272),
+	.BAUD        (32'd3_000_000),
+	.PAYLOAD_LEN (16'd256)
+) m7_reg_stream (
+	.clk       (clk_sys),
+	.rst       (~RESET_N),
+	.test_mode (2'd2),
+	.dbg_bytes (dbg_bytes),
+	.txd       (m7_stream_txd)
+);
+assign m7_dbg_tx = m7_stream_txd;
+wire dbg_uart_txd;   // legacy ASCII telemetry instance removed; port unused
+`else
+assign M7_DBG_LED = 8'h00;
+assign m7_dbg_tx = 1'b1;
 `endif
 
 endmodule

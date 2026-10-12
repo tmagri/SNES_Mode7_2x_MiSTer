@@ -44,3 +44,12 @@ set_false_path -from [get_registers { emu|sdram_download_* }] -to [get_registers
 #set_false_path -to [get_registers { emu|sdram|word[*] }]
 
 set_false_path -from {emu|en216p}
+
+# HD Mode 7 write-through snoop (M7_2X_ENABLE): the cart-SDRAM read buffer
+# (sdram|rbuf) combinationally reaches the PPU VRAM write-data bus, and the
+# Mode 7 write-through FIFO adds a register at the end of that chain. The
+# path is architectural dead fabric: VRAM write data originates from CPU/DMA
+# internal state, never from a same-cycle SDRAM read completion, so the two
+# endpoints can never co-activate. Same reasoning as the loose set_max_delay
+# 20 guarding the sdram<->main crossings above.
+set_false_path -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|wt_fifo[*][*] }]

@@ -1,0 +1,157 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "SNES HD M7: Compile (Docker)",
+            "type": "shell",
+            "command": "./snes_build.sh",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": {
+                "owner": "quartus",
+                "fileLocation": ["relative", "${workspaceFolder}"],
+                "pattern": {
+                    "regexp": "^(?:.*)(Error|Critical Warning)\\s*\\((\\d+)\\):\\s+(.*)File:\\s+(.*)Line:\\s+(\\d+)",
+                    "severity": 1,
+                    "code": 2,
+                    "message": 3,
+                    "file": 4,
+                    "line": 5
+                }
+            },
+            "isBackground": false
+        },
+        {
+            "label": "SNES HD M7: Compile + Deploy + Launch",
+            "type": "shell",
+            "command": "./snes_build_debug.sh --compile",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "SNES HD M7: Deploy All (daemon + rbf + launch)",
+            "type": "shell",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Daemon: Build on MiSTer (ssh)",
+                "SNES HD M7: Deploy + Launch (existing build)"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "SNES HD M7: Deploy All, no launch",
+            "type": "shell",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Daemon: Build on MiSTer (ssh)",
+                "SNES HD M7: Deploy only (no launch)"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "SNES HD M7: Deploy + Launch (existing build)",
+            "type": "shell",
+            "command": "./snes_build_debug.sh",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "SNES HD M7: Deploy only (no launch)",
+            "type": "shell",
+            "command": "./snes_build_debug.sh --no-launch",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Daemon: Build on MiSTer (ssh)",
+            "type": "shell",
+            "command": "scripts/daemon_build_mister.sh root@192.168.1.131",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Daemon: Cross-compile (local ARM toolchain)",
+            "type": "shell",
+            "command": "make -C daemon CROSS_COMPILE=arm-linux-gnueabihf-",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "SNES HD M7: Kill stuck build",
+            "type": "shell",
+            "command": "./snes_build_debug.sh --kill",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

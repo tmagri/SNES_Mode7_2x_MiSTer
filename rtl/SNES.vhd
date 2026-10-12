@@ -74,6 +74,7 @@ entity SNES is
 		VDE			: out std_logic;
 		HSYNC			: out std_logic;
 		VSYNC			: out std_logic;
+		VBLANK			: out std_logic;
 
 		JOY1_DI		: in std_logic_vector(1 downto 0);
 		JOY2_DI		: in std_logic_vector(1 downto 0);
@@ -246,6 +247,9 @@ begin
 	);
 	
 	GENIE_DI <= GENIE_DO when GENIE = '1' else CPU_DI;
+
+	-- PPU vblank level exported for the HD Mode 7 frame controller
+	VBLANK <= INT_VBLANK;
 
 	-- CPU
 	CPU : entity work.SCPU

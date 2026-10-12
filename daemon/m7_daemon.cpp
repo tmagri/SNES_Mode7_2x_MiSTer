@@ -1,294 +1,416 @@
-// Expose nanosleep / clock_gettime under g++ -std=c++11 on glibc (MiSTer).
+// Expose nanosleep / clock_gettime under g++ -std=c++11 on glibc (MiSTer);
+// _DEFAULT_SOURCE also pulls in the extended baud constants (B3000000).
 // macOS gets these via _DARWIN_C_SOURCE automatically, so only define on Linux.
-#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 199309L
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
 #endif
 
+#include "m7_abi.h"
+#include "m7_uart_parser.h"
+
 #include <cstdint>
-#include <ctime>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
-#include <fstream>
 #include <iostream>
-#include <sched.h>
 #include <string>
 #include <sys/mman.h>
+#include <termios.h>
 #include <unistd.h>
-#include <vector>
 
 // ===========================================================================
-// Phase C: True HD Mode 7 ARM C++ Daemon
+// True HD Mode 7 ARM daemon — PIVOT v2
 //
-// Communicates with the FPGA over a shared DDR3 memory window:
+// Transport reality (docs/m7_abi.md REVISION v2): f2sdram port-1 FPGA
+// writes are broken on this device, so the FPGA NEVER writes DDR3 — there
+// is no header, no heartbeat, no mailbox. The daemon is the only DDR3
+// writer (pixel buffers + ctrl word, proven path) and the FPGA reads them
+// back at clk_sys (proven path). FPGA->ARM control data arrives over the
+// HPS UART (/dev/ttyS1, rtl/m7_reg_stream.sv framing).
 //
-//   0x3E000000  M7 register mailbox (8 × 16-bit, written by FPGA per frame)
-//   0x3E001000  HD pixel buffer      (daemon writes, FPGA DMA reads)
-//   0x3E100000  VRAM1 mirror         (32K × 16-bit, written by FPGA per frame)
-//   0x3E108000  VRAM2 mirror         (32K × 16-bit, written by FPGA per frame)
-//   0x3E110000  CGRAM mirror         (256 × 16-bit, written by FPGA per frame)
+// P2b mode: test card. The daemon gates on a run of CRC-valid UART frames
+// (the bitstream gate — wrong rbf = silent line), fills the pixel buffer
+// with an animated diagonal sweep and publishes the ctrl word once; the
+// FPGA's continuous fetch loop then shows it in Mode 7 content. This
+// proves UART -> parse -> render -> DDR3 -> fetch -> screen end to end.
+// The real Mode 7 renderer below stays for P2c (it consumes the per-line
+// register stream that lands on the same framing).
 //
-// Each frame the daemon:
-//   1. Reads the Mode 7 affine registers from the mailbox.
-//   2. Reads VRAM1/VRAM2/CGRAM mirrors (refreshed by the FPGA every frame).
-//   3. Renders 4×-resolution Mode 7 scanlines with real tile lookups and
-//      palette conversion, including EXTBG compositing.
-//   4. Writes the HD pixels into the pixel buffer for the FPGA DMA reader.
+// Exit codes: 1 = /dev/mem or mmap failure, 2 = ttyS1 open/config failure,
+// 3 = no valid UART stream (wrong/absent bitstream).
 // ===========================================================================
 
-#define DDR3_PHYS_BASE 0x3E000000
-#define DDR3_SPAN      0x01000000   // 16 MB window
+namespace {
 
-#define SNES_WIDTH     256
-#define SNES_HEIGHT    224
+const char *kDevMem = "/dev/mem";
+// Optional kernel module (kernel/m7_mem_wc) exposing a write-combined
+// mapping of the two pixel buffers — avoids per-word Device-memory AXI
+// serialization on the 448 KiB/frame pixel push. Absent ⇒ /dev/mem fallback.
+const char *kDevWc = "/dev/m7_mem_wc";
+// Header + regs + ctrl + both pixel buffers live in the first 1 MiB;
+// VRAM/CGRAM images follow. One 2 MiB mapping covers everything.
+const uint32_t kMapSpan = 0x200000;
+// Byte size of the WC window: both ping-pong buffers, contiguous.
+const uint32_t kPixWindowSpan = 2u * M7_PIXBUF_BYTES;
 
-// Offsets from DDR3_PHYS_BASE to each region (must match the FPGA localparams).
-#define OFFS_MAILBOX   0x000000
-#define OFFS_PIXELS    0x002000
-#define OFFS_VRAM1     0x100000
-#define OFFS_VRAM2     0x108000
-#define OFFS_CGRAM     0x110000
+inline uint64_t now_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+}
+
+inline void sleep_ns(uint64_t ns) {
+  timespec ts = {static_cast<time_t>(ns / 1000000000ull),
+                 static_cast<long>(ns % 1000000000ull)};
+  nanosleep(&ts, nullptr);
+}
+
+// Convert SNES BGR555 (CGRAM) -> RGB565 (the pixel format the FPGA expects).
+inline uint16_t bgr555_to_rgb565(uint16_t bgr) {
+  bgr &= 0x7FFF;
+  const uint16_t r = bgr & 0x1F;
+  const uint16_t g = (bgr >> 5) & 0x1F;
+  const uint16_t b = (bgr >> 10) & 0x1F;
+  const uint16_t g6 = (g << 1) | (g >> 4);  // expand green 5 -> 6 bits
+  return (r << 11) | (g6 << 5) | b;
+}
+
+// Mode7Clip, matching PPU.vhd: res := a(13) & a(9 downto 0) sign-extended
+// from bit 13 (upstream fix 586644c). Applied to (HOFS-M7X)/(VOFS-M7Y)
+// before the affine multiply.
+inline int mode7_clip(int val) {
+  const int a14 = val & 0x3FFF;
+  int lower10 = a14 & 0x3FF;
+  if (a14 & 0x2000) lower10 -= 0x400;
+  return lower10;
+}
 
 struct M7Regs {
   int16_t a, b, c, d;
-  int16_t x, y;
-  int16_t hofs, vofs;
+  uint16_t x, y, hofs, vofs;  // 13-bit unsigned SNES register values
 };
 
+}  // namespace
+
 class M7Daemon {
-private:
-  int mem_fd;
-  void *virtual_base;
-  uint32_t       *hd_pixel_buffer;  // 32-bit view (DMA reads 64-bit chunks)
-  volatile uint16_t *mailbox_regs;
-  const uint16_t *vram1_mirror;   // 32K entries, each = one VRAM byte (low 8 bits)
-  const uint16_t *vram2_mirror;
-  const uint16_t *cgram_mirror;   // 256 entries, 15-bit BGR555
+ public:
+  M7Daemon(bool extbg) : extbg_(extbg) {}
 
-  uint16_t local_vram1[32768];
-  uint16_t local_vram2[32768];
-  uint16_t local_cgram[256];
+  // Returns 0 on success, else the process exit code (1 = /dev/mem or mmap
+  // failure, 2 = magic/version mismatch, 3 = no heartbeat). The message is
+  // already logged on failure.
+  int Init() {
+    mem_fd_ = open(kDevMem, O_RDWR | O_SYNC);
+    if (mem_fd_ == -1) {
+      std::cerr << "ERROR: could not open /dev/mem" << std::endl;
+      return 1;
+    }
+    map_ = static_cast<volatile uint8_t *>(
+        mmap(nullptr, kMapSpan, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd_,
+             M7_MAILBOX_BASE));
+    if (map_ == MAP_FAILED) {
+      std::cerr << "ERROR: mmap of " << std::hex << "0x" << M7_MAILBOX_BASE
+                << std::dec << " failed" << std::endl;
+      return 1;
+    }
 
-  int scale_multiplier;
-  int hd_width;
+    hdr_  = reinterpret_cast<volatile uint16_t *>(map_);
+    regs_ = reinterpret_cast<volatile uint16_t *>(map_ + (M7_REGS_BASE - M7_MAILBOX_BASE));
+    ctrl_ = reinterpret_cast<volatile uint32_t *>(map_ + (M7_CTRL_BASE - M7_MAILBOX_BASE));
 
-  int determine_snes_multiplier() {
-    std::ifstream ini_file("/media/fat/MiSTer.ini");
-    int target_height = 1080;
-    if (ini_file.is_open()) {
-      std::string line;
-      while (std::getline(ini_file, line)) {
-        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
-        if (line.find("video_mode") == 0) {
-          if      (line.find("1440") != std::string::npos) target_height = 1440;
-          else if (line.find("1080") != std::string::npos) target_height = 1080;
-          else if (line.find("720")  != std::string::npos) target_height = 720;
-          else if (line.find("480")  != std::string::npos) target_height = 480;
-        }
+    // Pixel buffers through the write-combined device when the module is
+    // loaded; the ctrl-word publish still goes over /dev/mem Device memory,
+    // so data-before-publish ordering is preserved without extra barriers.
+    wc_fd_ = open(kDevWc, O_RDWR | O_SYNC);
+    if (wc_fd_ != -1) {
+      wc_map_ = static_cast<volatile uint8_t *>(
+          mmap(nullptr, kPixWindowSpan, PROT_READ | PROT_WRITE, MAP_SHARED,
+               wc_fd_, M7_PIXBUF_BASE));
+      if (wc_map_ != MAP_FAILED) {
+        std::cout << "pixel window via " << kDevWc << " (write-combined)"
+                  << std::endl;
+      } else {
+        close(wc_fd_);
+        wc_fd_ = -1;
       }
-      ini_file.close();
     }
-    std::cout << "Detected Target Height: " << target_height << "p" << std::endl;
-    if (target_height >= 1344) return 6;
-    if (target_height >= 896)  return 4;
-    if (target_height >= 672)  return 3;
-    if (target_height >= 448)  return 2;
-    return 1;
-  }
+    const volatile uint8_t *pix_base =
+        (wc_map_ && wc_map_ != MAP_FAILED)
+            ? wc_map_
+            : map_ + (M7_PIXBUF_BASE - M7_MAILBOX_BASE);
+    pix_[0] = reinterpret_cast<volatile uint16_t *>(const_cast<uint8_t *>(pix_base));
+    pix_[1] = reinterpret_cast<volatile uint16_t *>(
+        const_cast<uint8_t *>(pix_base) + M7_PIXBUF_BYTES);
+    vr1_ = reinterpret_cast<volatile uint16_t *>(map_ + (M7_VRAM1_BASE - M7_MAILBOX_BASE));
+    vr2_ = reinterpret_cast<volatile uint16_t *>(map_ + (M7_VRAM2_BASE - M7_MAILBOX_BASE));
+    cg_  = reinterpret_cast<volatile uint16_t *>(map_ + (M7_CGRAM_BASE - M7_MAILBOX_BASE));
 
-public:
-  M7Daemon() {
-    mem_fd = open("/dev/mem", (O_RDWR | O_SYNC));
-    if (mem_fd == -1) { std::cerr << "ERROR: could not open /dev/mem" << std::endl; exit(1); }
-
-    virtual_base = mmap(NULL, DDR3_SPAN, (PROT_READ | PROT_WRITE), MAP_SHARED,
-                        mem_fd, DDR3_PHYS_BASE);
-    if (virtual_base == MAP_FAILED) {
-      std::cerr << "ERROR: mmap failed" << std::endl; close(mem_fd); exit(1);
+    // --- PIVOT v2 bitstream gate: the UART stream IS the handshake. The
+    // FPGA never writes DDR3, so there is no header magic to check; a
+    // run of CRC-valid frames proves the HD bitstream is loaded. ---
+    if (OpenStream() != 0) return 2;
+    if (!WaitStreamFrames(8, 5000)) {
+      std::cerr << "ERROR: no CRC-valid UART frames in 5 s — HD bitstream "
+                   "absent or stream misconfigured (need M7_2X_ENABLE rbf)"
+                << std::endl;
+      return 3;
     }
-
-    uint8_t *base = (uint8_t *)virtual_base;
-    mailbox_regs    = (volatile uint16_t *)(base + OFFS_MAILBOX);
-    hd_pixel_buffer = (uint32_t *)(base + OFFS_PIXELS);
-    vram1_mirror    = (const uint16_t *)(base + OFFS_VRAM1);
-    vram2_mirror    = (const uint16_t *)(base + OFFS_VRAM2);
-    cgram_mirror    = (const uint16_t *)(base + OFFS_CGRAM);
-
-    scale_multiplier = determine_snes_multiplier();
-    hd_width = SNES_WIDTH * scale_multiplier;
-
-    // Dynamic scale isn't wired to the FPGA yet (CMD_M7_SET_SCALE TODO).
-    // The FPGA defaults to 4×, so force 4× here to match.
-    if (scale_multiplier != 4) {
-      std::cerr << "WARNING: forcing 4× (FPGA default). Dynamic scale TODO." << std::endl;
-      scale_multiplier = 4;
-      hd_width = SNES_WIDTH * scale_multiplier;
-    }
-    std::cout << "M7 Multiplier: " << scale_multiplier << "× (width " << hd_width << ")" << std::endl;
+    std::cout << "stream OK: " << frames_valid_ << " valid frames, seq "
+              << last_seq_ << ", " << parser_.resyncs() << " resyncs, "
+              << M7_HD_SCALE << "x, lines " << M7_LINE_COUNT
+              << (extbg_ ? ", EXTBG on" : ", BG1 only") << std::endl;
+    return 0;
   }
 
   ~M7Daemon() {
-    if (virtual_base != MAP_FAILED) munmap(virtual_base, DDR3_SPAN);
-    close(mem_fd);
+    if (stream_fd_ != -1) close(stream_fd_);
+    if (map_ && map_ != MAP_FAILED) munmap(const_cast<uint8_t *>(map_), kMapSpan);
+    if (mem_fd_ != -1) close(mem_fd_);
+    if (wc_map_ && wc_map_ != MAP_FAILED)
+      munmap(const_cast<uint8_t *>(wc_map_), kPixWindowSpan);
+    if (wc_fd_ != -1) close(wc_fd_);
   }
 
-  // Read the 8 Mode 7 registers for a specific scanline from the per-line
-  // mailbox. The FPGA captures these at each start_of_scanline so HDMA
-  // changes (e.g. SMK's per-line perspective) are reflected correctly.
-  M7Regs read_m7_registers(int scanline) {
-    const int offset = scanline * 8;
-    M7Regs r;
-    r.a    = static_cast<int16_t>(mailbox_regs[offset + 0]);
-    r.b    = static_cast<int16_t>(mailbox_regs[offset + 1]);
-    r.c    = static_cast<int16_t>(mailbox_regs[offset + 2]);
-    r.d    = static_cast<int16_t>(mailbox_regs[offset + 3]);
-    r.x    = static_cast<int16_t>(mailbox_regs[offset + 4]);
-    r.y    = static_cast<int16_t>(mailbox_regs[offset + 5]);
-    r.hofs = static_cast<int16_t>(mailbox_regs[offset + 6]);
-    r.vofs = static_cast<int16_t>(mailbox_regs[offset + 7]);
-    return r;
-  }
+  void Run() {
+    std::cout << "P2b test-card mode" << std::endl;
 
-  // Convert SNES BGR555 (CGRAM) → RGB565 (wire format the FPGA expects).
-  static inline uint16_t bgr555_to_rgb565(uint16_t bgr) {
-    bgr &= 0x7FFF;
-    uint16_t r = bgr & 0x1F;
-    uint16_t g = (bgr >> 5) & 0x1F;
-    uint16_t b = (bgr >> 10) & 0x1F;
-    // Expand green 5→6 bits (replicate top bit into LSB).
-    uint16_t g6 = (g << 1) | (g >> 4);
-    return (r << 11) | (g6 << 5) | b;
-  }
+    // Fill both buffers with the static card, publish buffer 0 exactly ONCE
+    // and never flip: the FPGA's continuous fetch loop reads the same buffer
+    // forever. The animated repaint lands in the live buffer, so mid-write
+    // tearing is expected and harmless on a test card (real ping-pong and
+    // the flip handshake return in P2c with the register stream).
+    FillCard(pix_[0], 0);
+    FillCard(pix_[1], 0);
+    *ctrl_ = (1u & 0xFFFFu) | (0u << M7_CTRL_READY_BUF);
+    std::cout << "ctrl published (ready_seq=1, READY_BUF=0) — FPGA should "
+                 "start fetching" << std::endl;
 
-  // Mode7Clip: replicate the fix from upstream commit 586644c
-  // ("PPU: fix Mode7 calculation — Tiny Toon Adventures Wacky Sports Challenge").
-  //
-  // The FPGA's ORG_X/ORG_Y are 14-bit signed (M7HOFS-M7X / M7VOFS-M7Y).
-  // Before the affine multiply, the PPU passes them through Mode7Clip which
-  // truncates to bits [9:0] and sign-extends from bit [13]. Without this,
-  // games that use large HOFS/VOFS offsets render the wrong part of the map.
-  //
-  // VHDL: res := a(13) & a(9 downto 0);  -- 11-bit signed
-  static inline int mode7_clip(int val) {
-    int a14 = val & 0x3FFF;            // truncate to 14 bits
-    int lower10 = a14 & 0x3FF;         // bits [9:0]
-    if (a14 & 0x2000) lower10 -= 0x400; // sign-extend from bit 13
-    return lower10;
-  }
-
-  std::vector<uint16_t> render_hd_scanline(const M7Regs &regs, int scanline) {
-    std::vector<uint16_t> pixels(hd_width, 0);
-
-    // Screen-space Y.
-    int y_screen = scanline;
-
-    for (int x_screen = 0; x_screen < hd_width; ++x_screen) {
-      // Map HD x back to native SNES x for the affine input.
-      int native_x = x_screen / scale_multiplier;
-      int cx = native_x + regs.hofs - regs.x;
-      int cy = y_screen + regs.vofs - regs.y;
-
-      // Apply Mode7Clip before the affine multiply (upstream 586644c fix).
-      int cx_clip = mode7_clip(cx);
-      int cy_clip = mode7_clip(cy);
-
-      // Affine transform (signed 32-bit math, >>8 matches the SNES hardware).
-      int32_t tx = (int32_t)regs.a * cx_clip + (int32_t)regs.b * cy_clip;
-      int32_t ty = (int32_t)regs.c * cx_clip + (int32_t)regs.d * cy_clip;
-      int32_t map_x = (tx >> 8) + regs.x;
-      int32_t map_y = (ty >> 8) + regs.y;
-
-      // Wrap to 1024×1024 pixel space (128×128 tiles). This matches the
-      // SNES M7SEL repeat behaviour, which is what SMK uses.
-      int wx = map_x & 0x3FF;
-      int wy = map_y & 0x3FF;
-
-      // --- Tilemap lookup -----------------------------------------------
-      // tilemap word address = {tile_y[6:0], tile_x[6:0]} (14-bit)
-      int tile_x = (wx >> 3) & 0x7F;
-      int tile_y = (wy >> 3) & 0x7F;
-      int tilemap_addr = (tile_y << 7) | tile_x;
-      uint8_t tile_number = local_vram1[tilemap_addr] & 0xFF;
-
-      // --- Tile pixel lookup --------------------------------------------
-      // byte address = {tile_number[7:0], row[2:0], col[2:0]} (14-bit)
-      int col = wx & 7;
-      int row = wy & 7;
-      int tile_addr = (tile_number << 6) | (row << 3) | col;
-      uint8_t bg1_index = local_vram1[tile_addr] & 0xFF;
-
-      // --- EXTBG (BG2) layer --------------------------------------------
-      // VRAM2 high byte: bit 7 = priority, bits 6-0 = color index (into
-      // CGRAM at offset +128). Only meaningful when the game enables BG2
-      // in Mode 7, but rendering it unconditionally is harmless.
-      uint8_t extbg_byte = local_vram2[tile_addr] & 0xFF;
-      bool    extbg_pri  = extbg_byte & 0x80;
-      uint8_t extbg_idx  = extbg_byte & 0x7F;
-
-      // --- Compositing ---------------------------------------------------
-      // Standard SNES BG priority logic:
-      //   BG2 wins if it is opaque AND (it has priority OR BG1 is transparent)
-      uint16_t rgb565;
-      if (extbg_idx != 0 && (extbg_pri || bg1_index == 0)) {
-        rgb565 = bgr555_to_rgb565(local_cgram[128 + extbg_idx]);
-      } else {
-        rgb565 = bgr555_to_rgb565(local_cgram[bg1_index]);
-      }
-
-      pixels[x_screen] = rgb565;
-    }
-    return pixels;
-  }
-
-  void write_m7_pixels(const std::vector<uint16_t> &hd_pixels, int scanline) {
-    // Pack pixels as consecutive 16-bit RGB565 values. The FPGA DMA
-    // reader extracts 4 pixels per 64-bit DDR3 read (C.4 optimization).
-    uint16_t *buf = reinterpret_cast<uint16_t *>(hd_pixel_buffer);
-    int pixel_offset = scanline * hd_width;
-    for (int i = 0; i < hd_width; ++i)
-      buf[pixel_offset + i] = hd_pixels[i];
-  }
-
-  void run() {
-    std::cout << "Starting HD Mode 7 Daemon Main Loop..." << std::endl;
-
-    const long FRAME_NS = 1000000000L / 60; // ~16.67 ms
+    uint64_t anim_last = 0;
+    uint64_t log_last  = now_ns();
+    uint32_t phase = 0;
+    uint32_t log_mark = 0;
 
     while (true) {
-      struct timespec t0, t1;
-      clock_gettime(CLOCK_MONOTONIC, &t0);
+      const uint32_t got = PumpStream();
 
-      // Copy mirrors to local cached RAM to avoid saturating the DDR3 bus
-      // with millions of uncached random reads over the AXI bridge.
-      std::memcpy(local_vram1, (const void*)vram1_mirror, 32768 * sizeof(uint16_t));
-      std::memcpy(local_vram2, (const void*)vram2_mirror, 32768 * sizeof(uint16_t));
-      std::memcpy(local_cgram, (const void*)cgram_mirror, 256 * sizeof(uint16_t));
-
-      // Read per-line registers for each scanline so HDMA changes
-      // (SMK perspective, etc.) are captured correctly.
-      for (int scanline = 0; scanline < SNES_HEIGHT; ++scanline) {
-        M7Regs regs = read_m7_registers(scanline);
-        std::vector<uint16_t> hd_pixels = render_hd_scanline(regs, scanline);
-        write_m7_pixels(hd_pixels, scanline);
+      const uint64_t now = now_ns();
+      if (now - log_last >= 5000000000ull) {
+        log_last = now;
+        std::cout << "stream: " << frames_valid_ << " valid frames ("
+                  << (frames_valid_ - log_mark) / 5 << "/s), "
+                  << parser_.resyncs() << " resyncs, "
+                  << parser_.crc_bad() << " crc_bad" << std::endl;
+        log_mark = frames_valid_;
       }
+      if (got == 0) sleep_ns(20000000ull);  // nothing pending: 20 ms idle
 
-      // Pace to ~60 Hz so we don't starve the ARM and SPI DMA.
-      clock_gettime(CLOCK_MONOTONIC, &t1);
-      long elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
-      long sleep_ns = FRAME_NS - elapsed_ns;
-
-      // Force at least 2ms of sleep per frame to guarantee the MiSTer Main process 
-      // and SPI DMA have enough memory bandwidth to poll controllers without dropping packets.
-      if (sleep_ns < 2000000L) {
-        sleep_ns = 2000000L;
+      // M7_STATIC=1 freezes the card after the initial fill — display-path
+      // proof: with no mid-frame repaint tearing the screen must hold a
+      // perfectly stable (if vertically folded) pattern.
+      if (!static_card_ && now - anim_last >= 200000000ull) {  // ~5 fps repaint
+        anim_last = now;
+        phase = (phase + 1) & 0x1Fu;
+        FillCard(pix_[0], phase);
       }
-      struct timespec rem = {0, sleep_ns};
-      nanosleep(&rem, nullptr);
     }
   }
+
+ private:
+  // M7_STATIC=1 freezes the card after the initial fill (display-path proof)
+  const bool static_card_ = std::getenv("M7_STATIC") != nullptr;
+
+  // 256 native pixels x M7_HD_SCALE (one HD scanline, RGB565)
+  static const int HD_PIXELS_PER_LINE = 256 * static_cast<int>(M7_HD_SCALE);
+
+  // Extended baud constants (B3000000+) are Linux-only; fall back to the
+  // raw numeric value so the source still syntax-checks on macOS hosts.
+#ifdef B3000000
+#define M7_TTY_BAUD B3000000
+#else
+#define M7_TTY_BAUD 3000000
+#endif
+
+  int OpenStream() {
+    stream_fd_ = open("/dev/ttyS1", O_RDONLY | O_NOCTTY);
+    if (stream_fd_ == -1) {
+      std::cerr << "ERROR: open /dev/ttyS1 failed" << std::endl;
+      return -1;
+    }
+    termios tio {};
+    if (tcgetattr(stream_fd_, &tio) != 0) {
+      std::cerr << "ERROR: tcgetattr /dev/ttyS1 failed" << std::endl;
+      return -1;
+    }
+    tio.c_iflag = 0;  // raw: no parity handling, no strip, no flow control
+    tio.c_oflag = 0;
+    tio.c_lflag = 0;
+    tio.c_cflag = CS8 | CREAD | CLOCAL;
+    cfsetispeed(&tio, M7_TTY_BAUD);
+    cfsetospeed(&tio, M7_TTY_BAUD);
+    tio.c_cc[VMIN]  = 0;
+    tio.c_cc[VTIME] = 1;  // read() returns within 0.1 s of the last byte
+    if (tcsetattr(stream_fd_, TCSANOW, &tio) != 0) {
+      std::cerr << "ERROR: tcsetattr 3 Mbaud on /dev/ttyS1 failed" << std::endl;
+      return -1;
+    }
+    tcflush(stream_fd_, TCIFLUSH);
+    return 0;
+  }
+
+  // Drains whatever the UART has into the parser; returns how many new
+  // CRC-valid frames came out, and tracks sequence continuity.
+  uint32_t PumpStream() {
+    uint8_t buf[4096];
+    const int n = read(stream_fd_, buf, sizeof(buf));
+    uint32_t got = 0;
+    for (int i = 0; i < n; ++i) {
+      m7_uart_frame fr;
+      if (!parser_.feed(buf[i], &fr)) continue;
+      ++frames_valid_;
+      ++got;
+      last_seq_ = fr.seq;
+      if (have_seq_ && fr.seq != static_cast<uint16_t>(expect_seq_ + 1))
+        ++slips_;
+      expect_seq_ = fr.seq;
+      have_seq_ = true;
+    }
+    return got;
+  }
+
+  bool WaitStreamFrames(uint32_t need, uint32_t timeout_ms) {
+    const uint64_t deadline =
+        now_ns() + static_cast<uint64_t>(timeout_ms) * 1000000ull;
+    while (frames_valid_ < need) {
+      PumpStream();
+      if (now_ns() >= deadline) return false;
+      sleep_ns(2000000ull);
+    }
+    return true;
+  }
+
+  // Animated diagonal sweep, RGB565, 8-px bands — coarse enough that Mode 7
+  // scaling distortion (shear/squeeze/row drops) is obvious at a glance.
+  void FillCard(volatile uint16_t *buf, uint32_t phase) {
+    for (int y = 0; y < static_cast<int>(M7_LINE_COUNT); ++y) {
+      volatile uint16_t *row = buf + y * HD_PIXELS_PER_LINE;
+      const uint16_t base = static_cast<uint16_t>(((y / 8) + phase) & 0x1F);
+      for (int x = 0; x < HD_PIXELS_PER_LINE; ++x) {
+        const uint16_t v = static_cast<uint16_t>((base + (x / 8)) & 0x1F);
+        row[x] = static_cast<uint16_t>((v << 11) | ((v & 0x3F) << 5) | v);
+      }
+    }
+  }
+
+  bool WaitFrameSeqChange(uint32_t timeout_ms) {
+    const uint16_t start = hdr_[M7_HDR_FRAME_SEQ];
+    const uint64_t deadline = now_ns() + static_cast<uint64_t>(timeout_ms) * 1000000ull;
+    for (;;) {
+      if (hdr_[M7_HDR_FRAME_SEQ] != start) return true;
+      if (now_ns() >= deadline) return false;
+      sleep_ns(1000000ull);  // 1 ms poll
+    }
+  }
+
+  static void CopyPlane(volatile uint16_t *src, uint16_t *dst) {
+    for (uint32_t i = 0; i < M7_VRAM_WORDS; ++i) dst[i] = src[i];
+  }
+
+  // SNES VRAM is stored as two byte planes written by $2118/$2119 at the
+  // same word address: byte 2*w lives in plane 1, byte 2*w+1 in plane 2.
+  inline uint8_t VramByte(uint32_t word_addr, bool odd) const {
+    return odd ? static_cast<uint8_t>(loc_v2_[word_addr])
+               : static_cast<uint8_t>(loc_v1_[word_addr]);
+  }
+
+  void RenderLine(const M7Regs &r, int line, uint16_t *out) {
+    // Screen-space origin terms (pre-clip), then the affine transform.
+    const int cy_in = line + r.vofs - r.y;
+    const int cy_clip = mode7_clip(cy_in);
+    for (int x = 0; x < HD_PIXELS_PER_LINE; ++x) {
+      const int cx_in = (x / M7_HD_SCALE) + r.hofs - r.x;
+      const int cx_clip = mode7_clip(cx_in);
+
+      const int32_t tx = static_cast<int32_t>(r.a) * cx_clip +
+                         static_cast<int32_t>(r.b) * cy_clip;
+      const int32_t ty = static_cast<int32_t>(r.c) * cx_clip +
+                         static_cast<int32_t>(r.d) * cy_clip;
+      int map_x = (tx >> 8) + r.x;
+      int map_y = (ty >> 8) + r.y;
+
+      // Wrap into the 1024x1024 Mode 7 map/tile space (128x128 tiles).
+      const int wx = map_x & 0x3FF;
+      const int wy = map_y & 0x3FF;
+
+      // Tilemap entry: word address {tile_y[6:0], tile_x[6:0]}; the tile
+      // number is the entry's LOW byte, i.e. plane 1 at word w.
+      const uint32_t map_w = static_cast<uint32_t>((wy >> 3) * 128 + (wx >> 3));
+      const uint8_t tile = static_cast<uint8_t>(loc_v1_[map_w]);
+
+      // Tile pixel: word 0x2000 + tile*32 + row*4 + col/2; the byte is in
+      // plane 1 for even columns, plane 2 for odd columns.
+      const int col = wx & 7;
+      const int row = wy & 7;
+      const uint32_t tw =
+          0x2000u + tile * 32u + static_cast<uint32_t>(row) * 4u +
+          static_cast<uint32_t>(col >> 1);
+      const uint8_t px = VramByte(tw, col & 1);
+
+      if (extbg_) {
+        // EXTBG: the same pixel byte feeds both layers — bits 6:0 are the
+        // BG2 color index (palette +128) and bit 7 its priority; BG1 keeps
+        // the full 8-bit index.
+        const uint8_t bg2_idx = px & 0x7F;
+        const bool bg2_pri = px & 0x80;
+        if (bg2_idx != 0 && (bg2_pri || px == 0))
+          out[x] = bgr555_to_rgb565(loc_cg_[128 + bg2_idx]);
+        else
+          out[x] = bgr555_to_rgb565(loc_cg_[px]);
+      } else {
+        out[x] = bgr555_to_rgb565(loc_cg_[px]);
+      }
+    }
+  }
+
+  bool extbg_;
+  int mem_fd_ = -1;
+  int wc_fd_ = -1;
+  int stream_fd_ = -1;
+  volatile uint8_t *map_ = nullptr;
+  volatile uint8_t *wc_map_ = nullptr;
+  volatile uint16_t *hdr_;
+  volatile uint16_t *regs_;
+  volatile uint32_t *ctrl_;
+  volatile uint16_t *pix_[2];
+  volatile uint16_t *vr1_;
+  volatile uint16_t *vr2_;
+  volatile uint16_t *cg_;
+
+  uint16_t loc_v1_[M7_VRAM_WORDS];
+  uint16_t loc_v2_[M7_VRAM_WORDS];
+  uint16_t loc_cg_[256];
+  uint16_t line_px_[HD_PIXELS_PER_LINE];
+  uint16_t ready_seq_ = 0;
+
+  // UART stream state (FPGA -> ARM, rtl/m7_reg_stream.sv framing)
+  M7UartParser parser_;
+  uint32_t frames_valid_ = 0;
+  uint32_t slips_ = 0;
+  uint16_t last_seq_ = 0;
+  uint16_t expect_seq_ = 0;
+  bool have_seq_ = false;
 };
 
 int main(int argc, char *argv[]) {
-  M7Daemon daemon;
-  daemon.run();
+  bool extbg = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--extbg") extbg = true;
+  }
+
+  M7Daemon daemon(extbg);
+  const int init_rc = daemon.Init();
+  if (init_rc != 0) return init_rc;
+  daemon.Run();
   return 0;
 }

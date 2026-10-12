@@ -110,7 +110,7 @@ module main (
 	
 	input             DSP_FREQ,
 
-	// Phase 1: Mode 7 register outputs (for HPS/ARM snooping via hps_ext)
+	// Phase 1: Mode 7 register outputs (for the DDR3 mailbox in SNES.sv)
 	output     [15:0] M7A_OUT,
 	output     [15:0] M7B_OUT,
 	output     [15:0] M7C_OUT,
@@ -120,7 +120,13 @@ module main (
 	output     [12:0] M7HOFS_OUT,
 	output     [12:0] M7VOFS_OUT,
 
-	// Phase 1: HD pixel mux inputs (ARM-generated HD Mode 7 scanline pixels)
+	// True vblank level from the PPU (VBLANKn is delayed/gated elsewhere).
+	// The M7 frame controller uses its rising edge as the frame boundary.
+	output            VBLANK_OUT,
+
+	// Phase 1: HD pixel mux inputs — ports kept for pin compatibility, but
+	// the PPU-level mux was removed (it crossed CLK_VIDEO data into clk_sys);
+	// the HD overlay lives in sys_top now.
 	input      [23:0] HD_PIXEL_IN,
 	input             HD_MODE7_EN,
 
@@ -284,6 +290,7 @@ SNES SNES
 	.rgb_out({B,G,R}),
 	.hde(HBLANKn),
 	.vde(VBLANKn),
+	.vblank(VBLANK_OUT),
 	.hsync(HSYNC),
 	.vsync(VSYNC),
 
