@@ -68,6 +68,25 @@
 #define M7_RECF_VOFS 7  // 13-bit
 #define M7_RECLINE_SYNC 0xFEu // full sync: mask FF + M7SEL tail
 
+// --- VRAM records (P2c-3). Same len-prefixed stream, opcode in the LINE
+// byte (values outside 0..223 are opcodes). Address fields are plane-local
+// dpram byte addresses; ah bit7 = plane (0=plane1, 1=plane2), ah[6:0] =
+// addr[14:8]. Data bytes are consecutive addresses from addr. ---
+#define M7_RECVRAM_DUMP 0xFDu // [len][FD][al][ah][data...] resync chunk
+#define M7_RECVRAM_WT   0xFCu // [len][FC][al][ah][data...] write-through run
+#define M7_RECVRAM_DONE 0xFBu // [5][FB][seq][wt_drops l h] dump finished
+// Length budget: line/sync <= 20; WT runs <= 12 (8-entry coalesce); dump
+// chunks 244 (0xF4; short tail 132 = 0x84 at the plane end). A boundary
+// len byte is never 0xC3, so payload[0]==0xC3 at a record boundary means
+// telemetry.
+
+// --- Telemetry payload bytes (payload[0]==0xC3 slots), P2c-3 additions ---
+#define M7_TEL_DUMP_PHASE 132 // 0 idle, 1 plane1, 2 plane2, 3 done
+#define M7_TEL_DUMP_SEQ   133 // completed dump counter (8-bit wrap)
+#define M7_TEL_VRAM1_VER  134 // 16-bit plane-1 write-through version (l,h)
+#define M7_TEL_VRAM2_VER  136 // 16-bit plane-2 write-through version (l,h)
+#define M7_TEL_WT_DROPS   138 // 16-bit write-through drop count (l,h)
+
 // VRAM image size: 32768 words (one 16-bit slot per VRAM byte).
 #define M7_VRAM_WORDS 32768u
 

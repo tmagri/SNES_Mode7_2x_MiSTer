@@ -17,6 +17,7 @@ daemon/*.o
 .DS_Store
 __pycache__/
 daemon/test_uart_parser
+daemon/test_mode7_renderer
 c5_pin_model_dump.txt
 
 # Staged bitstream (built by snes_build.sh, never tracked)

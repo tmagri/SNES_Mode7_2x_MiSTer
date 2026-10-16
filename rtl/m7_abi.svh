@@ -72,6 +72,27 @@ localparam [2:0] M7_RECF_HOFS = 6;  // 13-bit
 localparam [2:0] M7_RECF_VOFS = 7;  // 13-bit
 localparam [7:0] M7_RECLINE_SYNC = 8'hFE; // full sync: mask FF + M7SEL tail
 
+// --- VRAM records (P2c-3). Same len-prefixed stream, opcode in the LINE
+// byte (values outside 0..223 are opcodes). Address fields are plane-local
+// dpram byte addresses; ah bit7 = plane (0=plane1, 1=plane2), ah[6:0] =
+// addr[14:8]. Data bytes are consecutive addresses from addr. ---
+localparam [7:0] M7_RECVRAM_DUMP = 8'hFD; // [len][FD][al][ah][data...] resync chunk
+localparam [7:0] M7_RECVRAM_WT   = 8'hFC; // [len][FC][al][ah][data...] write-through run
+localparam [7:0] M7_RECVRAM_DONE = 8'hFB; // [5][FB][seq][wt_drops l h] dump finished
+// Record length budget (daemon parser kRecMax + telemetry discrimination):
+// line/sync records are <=20; WT runs coalesce at most 8 FIFO entries
+// (len<=12); dump chunks are 240 data bytes (len 244=0xF4, short tail
+// 132=0x84 at the 32 KiB plane end). A boundary len byte is therefore
+// never 0xC3 — only a genuine telemetry slot starts a payload with 0xC3
+// when the daemon parser is at a record boundary.
+
+// --- Telemetry payload bytes (payload[0]==0xC3 slots), P2c-3 additions ---
+localparam [7:0] M7_TEL_DUMP_PHASE = 132; // 0 idle, 1 plane1, 2 plane2, 3 done
+localparam [7:0] M7_TEL_DUMP_SEQ   = 133; // completed dump counter (8-bit wrap)
+localparam [7:0] M7_TEL_VRAM1_VER  = 134; // 16-bit plane-1 wt version (l,h)
+localparam [7:0] M7_TEL_VRAM2_VER  = 136; // 16-bit plane-2 wt version (l,h)
+localparam [7:0] M7_TEL_WT_DROPS   = 138; // 16-bit wt drop count (l,h)
+
 // --- 64-bit read-port word addresses (physical byte >> 3) ---
 localparam [28:0] M7_CTRL_WORD     = 29'h07C00200;  // M7_CTRL_BASE     >> 3
 localparam [28:0] M7_PIXBUF_WORD   = 29'h07C00400;  // M7_PIXBUF_BASE   >> 3

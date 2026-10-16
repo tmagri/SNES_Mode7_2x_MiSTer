@@ -1389,6 +1389,7 @@ reg        final_ce_pixel;
 wire [3:0]  m7_scale;
 wire        hd_px_valid;
 wire [23:0] hd_pixel_in;
+wire        hd_pixel_opaque;
 wire        hd_line_armed;
 
 // One strobe per scaled output pixel. The linebuf registers hd_px_valid +
@@ -1436,7 +1437,7 @@ always @(posedge clk_vid) begin
 	// striping). Non-valid cycles on armed lines hold the last HD pixel;
 	// only genuinely disarmed lines fall back to native.
 	if (hd_px_valid) begin
-		final_rgb_out <= hd_pixel_in;
+		final_rgb_out <= hd_pixel_opaque ? hd_pixel_in : snes_rgb_out;
 	end else if (~ce_d && !hd_line_armed) begin
 		final_rgb_out <= snes_rgb_out;
 	end
@@ -1826,6 +1827,7 @@ emu emu
 	.M7_SCALE(m7_scale),
     .HD_PIXEL_VALID(hd_px_valid),
     .HD_PIXEL_IN(hd_pixel_in),
+	.HD_PIXEL_OPAQUE(hd_pixel_opaque),
     .HD_LINE_ARMED(hd_line_armed),
     .HD_PX_STROBE(HD_PX_STROBE),
 	.HPS_BUS({fb_en, sl, f1, HDMI_TX_VS, 

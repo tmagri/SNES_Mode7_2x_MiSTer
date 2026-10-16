@@ -68,6 +68,7 @@ module hd_mode7_linebuf
 
     // --- Output to sys_top overlay (clk_vid) ---
     output wire [23:0] hd_pixel_out,
+    output reg         hd_pixel_opaque,
     output reg         hd_px_valid
 );
 
@@ -155,6 +156,7 @@ module hd_mode7_linebuf
     always @(posedge clk_vid) begin
         rd_idx      <= slotram[rd_slot_s2][rd_x[9:2]];
         rd_rgb      <= clut[rd_idx];
+        hd_pixel_opaque <= (rd_idx != 8'd0);
         v1          <= px_strobe & armed;
         hd_px_valid <= v1;
     end

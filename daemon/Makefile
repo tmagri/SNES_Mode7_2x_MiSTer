@@ -31,7 +31,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJS)
 
-m7_daemon.o: m7_daemon.cpp m7_abi.h m7_uart_parser.h
+m7_daemon.o: m7_daemon.cpp m7_abi.h m7_uart_parser.h m7_mode7_renderer.h
 	$(CXX) $(CXXFLAGS) -c m7_daemon.cpp
 
 install: $(TARGET)
@@ -40,7 +40,7 @@ install: $(TARGET)
 	( cd $(INSTALL_DIR) && sha256sum $(TARGET) > $(TARGET).sha256 )
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) test_mode7_renderer
 
 # Host-side parser test against a raw UART capture (no cross toolchain):
 #   make test CAP=/tmp/m7tb/uart_cap.bin
@@ -52,4 +52,10 @@ test: test_uart_parser
 test_uart_parser: test_uart_parser.cpp m7_uart_parser.h
 	g++ -Wall -O2 -std=c++11 -o $@ $<
 
-.PHONY: all install clean test
+test_mode7_renderer: test_mode7_renderer.cpp m7_mode7_renderer.h m7_abi.h
+	g++ -Wall -O2 -std=c++11 -o $@ $<
+
+test-renderer: test_mode7_renderer
+	./test_mode7_renderer
+
+.PHONY: all install clean test test-renderer

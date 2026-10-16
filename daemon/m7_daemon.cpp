@@ -6,6 +6,7 @@
 #endif
 
 #include "m7_abi.h"
+#include "m7_mode7_renderer.h"
 #include "m7_uart_parser.h"
 
 #include <cstdint>
@@ -34,8 +35,8 @@
 // with an animated diagonal sweep and publishes the ctrl word once; the
 // FPGA's continuous fetch loop then shows it in Mode 7 content. This
 // proves UART -> parse -> render -> DDR3 -> fetch -> screen end to end.
-// The real Mode 7 renderer below stays for P2c (it consumes the per-line
-// register stream that lands on the same framing).
+// The software renderer consumes the per-line register and VRAM records on
+// the same framing, then publishes one 8bpp CLUT-index row per scanline.
 //
 // Exit codes: 1 = /dev/mem or mmap failure, 2 = ttyS1 open/config failure,
 // 3 = no valid UART stream (wrong/absent bitstream).
@@ -66,30 +67,23 @@ inline void sleep_ns(uint64_t ns) {
   nanosleep(&ts, nullptr);
 }
 
-// Convert SNES BGR555 (CGRAM) -> RGB565 (the pixel format the FPGA expects).
-inline uint16_t bgr555_to_rgb565(uint16_t bgr) {
-  bgr &= 0x7FFF;
-  const uint16_t r = bgr & 0x1F;
-  const uint16_t g = (bgr >> 5) & 0x1F;
-  const uint16_t b = (bgr >> 10) & 0x1F;
-  const uint16_t g6 = (g << 1) | (g >> 4);  // expand green 5 -> 6 bits
-  return (r << 11) | (g6 << 5) | b;
+// /dev/mem maps of RAM-range physical addresses are CACHEABLE on ARM32
+// mainline (pfn_valid ⇒ MT_MEMORY, not Device). Stores to a cold line sit
+// dirty in L2 indefinitely — the FPGA's f2sdram read path (physical DDR3)
+// never sees them. A single 32-bit ctrl store has no streaming pressure to
+// force eviction, so every publish must clean the line explicitly. The
+// glibc wrapper header (sys/cachectl.h) is missing from the cross sysroot,
+// so call the ARM private syscall directly: __ARM_NR_cacheflush(start, end,
+// flags=0 clean+invalidate), stable ABI since ARM Linux 2.6.
+#if defined(__arm__)
+inline long CacheFlush(volatile void *addr, size_t bytes) {
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+  return syscall(0x0F0002, reinterpret_cast<void *>(begin),
+                 reinterpret_cast<void *>(begin + bytes), 0);
 }
-
-// Mode7Clip, matching PPU.vhd: res := a(13) & a(9 downto 0) sign-extended
-// from bit 13 (upstream fix 586644c). Applied to (HOFS-M7X)/(VOFS-M7Y)
-// before the affine multiply.
-inline int mode7_clip(int val) {
-  const int a14 = val & 0x3FFF;
-  int lower10 = a14 & 0x3FF;
-  if (a14 & 0x2000) lower10 -= 0x400;
-  return lower10;
-}
-
-struct M7Regs {
-  int16_t a, b, c, d;
-  uint16_t x, y, hofs, vofs;  // 13-bit unsigned SNES register values
-};
+#else
+inline long CacheFlush(volatile void *, size_t) { return 0; }
+#endif
 
 }  // namespace
 
@@ -142,10 +136,6 @@ class M7Daemon {
     pix_[0] = reinterpret_cast<volatile uint16_t *>(const_cast<uint8_t *>(pix_base));
     pix_[1] = reinterpret_cast<volatile uint16_t *>(
         const_cast<uint8_t *>(pix_base) + M7_PIXBUF_BYTES);
-    vr1_ = reinterpret_cast<volatile uint16_t *>(map_ + (M7_VRAM1_BASE - M7_MAILBOX_BASE));
-    vr2_ = reinterpret_cast<volatile uint16_t *>(map_ + (M7_VRAM2_BASE - M7_MAILBOX_BASE));
-    cg_  = reinterpret_cast<volatile uint16_t *>(map_ + (M7_CGRAM_BASE - M7_MAILBOX_BASE));
-
     // --- PIVOT v2 bitstream gate: the UART stream IS the handshake. The
     // FPGA never writes DDR3, so there is no header magic to check; a
     // run of CRC-valid frames proves the HD bitstream is loaded. ---
@@ -172,44 +162,90 @@ class M7Daemon {
     if (wc_fd_ != -1) close(wc_fd_);
   }
 
+  // The ctrl word is a one-store-per-event write to a cold cache line: with
+  // a cached /dev/mem mapping it never reaches DDR3 without an explicit
+  // clean (the FPGA's ctrl poller reads physical memory every frame).
+  void PublishCtrl(uint32_t w) {
+    *ctrl_ = w;
+    const long r = CacheFlush(ctrl_, sizeof(*ctrl_));
+    static int log_n = 0;
+    if (++log_n <= 4)
+      std::cout << "publish seq=" << (w & 0xFFFF) << " flush_ret=" << r
+                << std::endl;
+  }
+
   void Run() {
-    std::cout << "P2c-2 reg-stream mode (per-line records + debug viz)"
+    std::cout << "P2c Mode 7 software renderer (per-line register + VRAM stream)"
               << std::endl;
 
-    // Show the static test card until the first vblank sync record arrives,
-    // then repaint from the per-line register shadow at every frame
-    // boundary the FPGA reports. With M7_STATIC the first sync publishes
-    // one shadow frame and nothing further changes.
     FillCard(0, 0);
     FillCard(1, 0);
     cur_pub_ = 0;
     ready_seq_ = 1;
-    *ctrl_ = CtrlWord(ready_seq_, cur_pub_);
+    PublishCtrl(CtrlWord(ready_seq_, cur_pub_, false));
     std::cout << "ctrl published (ready_seq=1, READY_BUF=0, FMT8) — FPGA "
                  "should start fetching" << std::endl;
 
     uint64_t log_last = now_ns();
     uint32_t log_mark = 0;
     uint32_t last_syncs = 0;
-    bool published_viz = false;
+    bool published_frame = false;
 
     while (true) {
       PumpStream();
 
-      // Frame boundary: the sync (line 0xFE) arrives after the whole
-      // frame's records, so the shadow is complete — repaint the inactive
-      // buffer and flip.
-      if (syncs_ != last_syncs && shadow_synced_) {
+      // The full-sync record follows the line records at vblank. Do not
+      // render until the initial VRAM snapshot is complete as well.
+      if (syncs_ != last_syncs) {
         last_syncs = syncs_;
-        if (!static_card_ || !published_viz) {
+        if (completed_frame_ready_ && vram_valid_ &&
+            (!static_card_ || !published_frame)) {
           cur_pub_ ^= 1u;
-          FillRegViz(cur_pub_);
-          *ctrl_ = CtrlWord(++ready_seq_, cur_pub_);
-          published_viz = true;
+          RenderFrame(cur_pub_);
+          PublishCtrl(CtrlWord(++ready_seq_, cur_pub_, false));
+          last_render_ns_ = now_ns();
+          published_frame = true;
+          completed_frame_ready_ = false;
         }
       }
 
       const uint64_t now = now_ns();
+      // Periodic VRAM resync: the write-through channel cannot carry a
+      // stream-heavy game's VRAM writes (SMK streams map tiles every frame;
+      // the daemon receives ~1-byte wt fragments and its image goes stale —
+      // visibly: multicolor pixel noise over an otherwise recognizable
+      // frame). The pre-v4 dump storm re-synced VRAM every 3-5 s by
+      // accident and the image benefited from it; institutionalize that
+      // benefit in bounded form: one paced re-request per interval while
+      // the renderer is actually publishing (the yield cap keeps line
+      // coverage alive during dumps, and dstat outranks chunks so
+      // completions still land promptly).
+      if (!dump_requested_ && !dump_req_pending_ && vram_valid_ &&
+          now - last_render_ns_ < 2000000000ull &&
+          now - last_resync_ns_ >= kResyncIntervalNs) {
+        last_resync_ns_   = now;
+        dump_req_pending_ = true;
+      }
+      // VRAM resync lifecycle: publish a pending request (cooldown-paced)
+      // and re-request when a dump in flight stalls past the timeout.
+      MaybeRequestDump(now);
+      if (dump_clear_pending_ && now >= dump_clear_at_ns_) {
+        // DUMP_REQ re-arm: the FPGA re-arms its request latch only on an
+        // adopted word with the bit CLEAR (a level, edge-detected against
+        // the latch). While stuck waiting for a first successful dump we
+        // publish nothing but request words, so the latch would stay
+        // disarmed forever and every request after the first is silently
+        // swallowed. Follow each request with one clear word; the FPGA's
+        // per-frame ctrl poll always adopts the request word first.
+        dump_clear_pending_ = false;
+        PublishCtrl(CtrlWord(++ready_seq_, cur_pub_, false));
+        std::cout << "dump_req clear word published (ready_seq=" << ready_seq_
+                  << ")" << std::endl;
+      }
+      if (dump_requested_ && now - dump_requested_at_ns_ >= kDumpTimeoutNs) {
+        dump_requested_ = false;
+        dump_req_pending_ = true;
+      }
       if (now - log_last >= 5000000000ull) {
         log_last = now;
         std::cout << "stream: " << frames_valid_ << " valid frames ("
@@ -218,7 +254,17 @@ class M7Daemon {
                   << parser_.crc_bad() << " crc_bad | syncs=" << syncs_
                   << " lines=" << rec_lines_ << " sel=0x"
                   << std::hex << static_cast<int>(m7sel_) << std::dec
-                  << " drops=" << static_cast<int>(tel_drops_) << std::endl;
+                  << " drops=" << static_cast<int>(tel_drops_)
+                  << " wtdrop=" << tel_wt_drops_ << " dumps=" << dumps_done_
+                  << " fb=" << static_cast<int>(fb_seq_seen_)
+                  << "/" << static_cast<int>(tel_dump_seq_)
+                  << " dm=" << static_cast<int>(tel_dm_)
+                  << " rd=" << tel_rd_ << " bc=" << tel_bc_
+                  << " bw=" << tel_bw_ << " rcnt=" << tel_rcnt_
+                  << " cov=" << cov_lines_last_ << "/224 g=" << cov_gap_last_
+                  << " wt=" << wt_recs_last_ << "r/" << wt_bytes_last_ << "B"
+                  << (dump_requested_ ? " dumpWAIT" : "")
+                  << (dump_req_pending_ ? " dumpREQ" : "") << std::endl;
         log_mark = frames_valid_;
       }
       sleep_ns(2000000ull);  // 2 ms poll; syncs arrive at 60 Hz
@@ -227,18 +273,20 @@ class M7Daemon {
 
  private:
   // Ctrl word v2: ready_seq | buffer << 16 | FMT8 (bit 17, required).
-  static uint32_t CtrlWord(uint32_t seq, uint32_t buf) {
+  // DUMP_REQ (bit 18) asks the FPGA for a VRAM resync dump. The FPGA
+  // consumes the bit when it adopts the word (and is not already
+  // dumping), then re-arms its trigger the next time it sees the bit
+  // clear — so the daemon sets it for exactly one publish per request.
+  static uint32_t CtrlWord(uint32_t seq, uint32_t buf, bool dump_req) {
     return (seq & 0xFFFFu) | (buf << M7_CTRL_READY_BUF) |
-           (1u << M7_CTRL_FMT8);
+           (1u << M7_CTRL_FMT8) |
+           (dump_req ? (1u << M7_CTRL_DUMP_REQ) : 0u);
   }
 
 
  private:
   // M7_STATIC=1 freezes the card after the initial fill (display-path proof)
   const bool static_card_ = std::getenv("M7_STATIC") != nullptr;
-
-  // 256 native pixels x M7_HD_SCALE (one HD scanline, RGB565)
-  static const int HD_PIXELS_PER_LINE = 256 * static_cast<int>(M7_HD_SCALE);
 
   // Extended baud constants (B3000000+) are Linux-only; fall back to the
   // raw numeric value so the source still syntax-checks on macOS hosts.
@@ -292,8 +340,119 @@ class M7Daemon {
         ++slips_;
       expect_seq_ = fr.seq;
       have_seq_ = true;
-      if (fr.len >= 132 && fr.payload[0] == 0xC3) {
-        tel_drops_ = fr.payload[131];
+      // Telemetry slots carry payload[0]=0xC3. A record payload can only
+      // start with 0xC3 if the stream is at a record BOUNDARY (a len
+      // byte) — boundary len bytes are <=20, <=12, 132 or 244, never
+      // 195. Mid-record (carry pending) the first byte is arbitrary
+      // data, so the payload MUST go to the record parser or those
+      // bytes are lost for good.
+      if (fr.payload[0] == 0xC3 && carry_len_ == 0) {
+        if (fr.len >= 132) tel_drops_ = fr.payload[131];
+        // FPGA dump-machinery window (bytes 140-147, P2c-3 diag block):
+        // dm = fetch/dump FSM state, rd = dump read pointer, bc = bytes
+        // landed in the in-flight chunk, bw = byte-window cycles ever,
+        // rcnt = record-ring fill. A frozen tel_dump_seq_ with rd==0 means
+        // dumps never start (arm/adoption path); rd moving means one is
+        // streaming; rcnt pinned high means the ring stopped draining.
+        if (fr.len >= 148) {
+          tel_dm_   = fr.payload[1] & 7;
+          tel_rd_   = le16(fr.payload + 140);
+          tel_bc_   = le16(fr.payload + 142);
+          tel_bw_   = le16(fr.payload + 144);
+          tel_rcnt_ = le16(fr.payload + 146);
+        }
+        // Capability probe: pre-P2c-3 bitstreams fill telemetry bytes
+        // 132+ with 0xAA. One telemetry frame decides whether VRAM dump
+        // requests are safe to send at all.
+        if (fr.len >= 140) {
+          if (!tel_probe_done_) {
+            tel_probe_done_ = true;
+            dump_capable_ = fr.payload[132] != 0xAA;
+            if (dump_capable_) {
+              dump_req_pending_ = true;  // boot-time full snapshot
+              std::cout << "VRAM dump channel detected — boot resync "
+                           "armed" << std::endl;
+            } else {
+              std::cout << "bitstream lacks VRAM dump channel (pre-P2c-3 "
+                           "rbf); renderer disabled" << std::endl;
+            }
+          }
+          if (dump_capable_) {
+            tel_dump_seq_  = fr.payload[133];
+            // 0xFB-loss watchdog v3 (freeze semantics + seq bias): fb_seq_seen_
+            // ADVANCING is itself the proof that completion records are
+            // flowing. TWO structural facts make "tel != fb" a BAD alarm:
+            // (1) the FPGA bumps dump_seq when the 0xFB finishes entering
+            // the ring, but the record CARRIES the pre-increment value — so
+            // tel == fb+1 is the HEALTHY steady state forever (the -1 in
+            // the comparison below); the old "tel != fb while idle" test
+            // therefore fired between EVERY pair of dumps, each fire
+            // requesting another dump: the ~5 s-per-dump storm seen on
+            // device with build 3. (2) Under continuous re-dumping tel
+            // running one ahead is legitimate indefinitely (the dump
+            // treadmill: watchdog re-request -> dump -> lag re-arms the
+            // watchdog, starving the renderer — 1 publish in 4 min at its
+            // worst, lines= collapsed 14k/s -> 49/s on device). The real
+            // failure mode (record-FIFO aliasing class) is fb FROZEN while
+            // tel climbs past fb+1. Alarm only on that, across
+            // kFbMissTelSamples samples.
+            if (fb_seq_seen_ != fb_seq_prev_) {
+              fb_seq_prev_      = fb_seq_seen_;
+              tel_seq_mismatch_ = 0;
+            } else if (!dump_requested_ &&
+                       static_cast<uint8_t>(tel_dump_seq_ - 1 - fb_seq_seen_) != 0) {
+              if (tel_seq_mismatch_ < 255) ++tel_seq_mismatch_;
+              if (tel_seq_mismatch_ == kFbMissTelSamples) {
+                // v3: DIAGNOSTIC ONLY. On device this fired every ~1.5 s
+                // even at a 2.25 s grace, and each fire's own line showed
+                // tel=fb+1 BEFORE the fire's request existed — i.e. dumps
+                // ring-enter with no outstanding daemon request (the FPGA
+                // self-triggers; suspected garbage ctrl-word reads while
+                // dump traffic floods the f2sdram port). Every dump still
+                // completes (fb advances ~0.7/s), so the image is being
+                // re-proven continuously and invalidating + re-requesting
+                // here only starved the renderer (1 publish in minutes)
+                // and fed the treadmill. If fb ever truly freezes while
+                // tel climbs (the lost-completion failure mode), this
+                // line fires forever — visible in one log read; the
+                // 3 s stall timeout remains the re-request backstop.
+                std::cout << "dump_seq=" << static_cast<int>(tel_dump_seq_)
+                          << " ahead of 0xFB (fb_seq="
+                          << static_cast<int>(fb_seq_seen_)
+                          << ") -- completion record lost (diagnostic)"
+                          << std::endl;
+                // Recovery (not invalidation): the dominant real cause is a
+                // SWALLOWED REQUEST (wedged dump FSM from a kill-time
+                // ring-full 0xFB drop — dump_active never cleared), which
+                // leaves tel frozen ahead of fb forever and also disarms
+                // the 3 s timeout via the stale FB. Re-request so the next
+                // healthy window actually dumps. Keep the image live:
+                // wt records keep it fresh and dumps don't touch video
+                // buffers, so there is nothing to invalidate.
+                if (!dump_requested_) dump_req_pending_ = true;
+              }
+            } else {
+              tel_seq_mismatch_ = 0;
+            }
+            tel_vram1_ver_ = le16(fr.payload + 134);
+            tel_vram2_ver_ = le16(fr.payload + 136);
+            // wt_drops drift detector: DISABLED (P2c-3 device evidence).
+            // The 16-bit field tears under sampling: the high byte shows
+            // ±32k instability, and the device also produced small false
+            // deltas — requests cycled every ~2 s while the counter read
+            // IDENTICAL across two consecutive 5 s status lines, i.e.
+            // nothing was actually dropping. Each false fire invalidated
+            // a proven VRAM image and re-dumped (~67 kB = ~20 % of the
+            // UART budget per dump), starving line records and sustaining
+            // the dump treadmill together with the old watchdog. A
+            // trustworthy resync trigger needs an FPGA-side STICKY burst
+            // latch (set on any drop, cleared by the next ctrl word), not
+            // a sampled counter. Until then wt holes from genuine drops
+            // stay cosmetic (stale tiles until the next dump); dumps are
+            // requested on boot, crc_bad, and the FB-loss watchdog only.
+            tel_wt_drops_ = le16(fr.payload + 138);
+          }
+        }
       } else {
         ProcessRecordPayload(fr.payload, static_cast<int>(fr.len));
       }
@@ -301,6 +460,10 @@ class M7Daemon {
     if (parser_.crc_bad() != crc_bad_seen_) {
       crc_bad_seen_ = parser_.crc_bad();
       pending_invalidate_ = true;  // a record payload may be lost
+      // A lost payload can contain VRAM records — holes no line/sync
+      // record can repair. Re-dump (unless one is already streaming;
+      // its 0xFB covers the loss).
+      if (!dump_requested_) dump_req_pending_ = true;
     }
     return got;
   }
@@ -316,6 +479,23 @@ class M7Daemon {
     return true;
   }
 
+  // Publishes one ctrl word with DUMP_REQ set (bumping ready_seq so the
+  // FPGA adopts it). Cooldown-paced so a storm of triggers costs at most
+  // one request per second. The FPGA consumes the bit only when idle.
+  void MaybeRequestDump(uint64_t now) {
+    if (!dump_capable_ || !dump_req_pending_) return;
+    if (now - dump_req_last_ns_ < kDumpCooldownNs) return;
+    dump_req_last_ns_     = now;
+    dump_requested_at_ns_ = now;
+    dump_req_pending_     = false;
+    dump_requested_       = true;
+    PublishCtrl(CtrlWord(++ready_seq_, cur_pub_, true));
+    dump_clear_pending_ = true;
+    dump_clear_at_ns_   = now + kDumpClearDelayNs;
+    std::cout << "VRAM resync dump requested (ready_seq=" << ready_seq_
+              << ")" << std::endl;
+  }
+
   // Test card: one CLUT index byte per native pixel, 8-px diagonal bands
   // cycling through the full 256-entry palette — coarse enough that Mode 7
   // scaling distortion (shear/squeeze/row drops) is obvious at a glance,
@@ -329,6 +509,9 @@ class M7Daemon {
         row[x] = static_cast<uint8_t>(base + (x / 8));
       }
     }
+    // Streaming a whole buffer evicts its lines naturally, but flush so the
+    // card is visible to the FPGA deterministically before the first frame.
+    CacheFlush(buf, static_cast<size_t>(M7_LINE_COUNT) * M7_PIX_STRIDE);
   }
 
   // ------------------------------------------------------------------
@@ -342,7 +525,9 @@ class M7Daemon {
   // 8 values + M7SEL tail): it resets the delta chain on both sides. A
   // CRC-failed payload invalidates per-line values until the next sync.
   // ------------------------------------------------------------------
-  static const int kRecMax = 32;
+  // Longest record on the wire: a full dump chunk is [len][FD][al][ah]
+  // + 240 data bytes = 244 (short tail 132 at the 32 KiB plane end).
+  static const int kRecMax = 244;
 
   static uint16_t le16(const uint8_t *p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -390,11 +575,39 @@ class M7Daemon {
   void ApplyRecord(const uint8_t *r, int len) {
     const uint8_t line = r[1];
     const uint8_t mask = r[2];
+
+    if (line == M7_RECVRAM_DUMP || line == M7_RECVRAM_WT) {
+      ApplyVramRecord(r, len);
+      return;
+    }
+    if (line == M7_RECVRAM_DONE) {
+      // Dump finished: [5][FB][seq][wt_drops l h]. The image is complete
+      // and the counter is re-baselined so drops that happened before the
+      // dump don't retrigger drift forever.
+      if (len == 5) {
+        vram_valid_       = true;
+        tel_wt_drops_     = le16(r + 3);
+        dump_requested_   = false;
+        fb_seq_seen_      = r[2];
+        tel_seq_mismatch_ = 0;
+        ++dumps_done_;
+      }
+      return;
+    }
     if (line == 0xFF) return;  // reserved
 
     if (line == 0xFE) {
       // Full sync: [20][FE][FF][A B C D X Y H V][SEL]
       if (len < 20) return;
+      if (shadow_synced_ && !pending_invalidate_) {
+        FillShadowThrough(M7_LINE_COUNT);
+        memcpy(completed_shadow_, shadow_, sizeof(shadow_));
+        memcpy(completed_line_ok_, line_ok_, sizeof(line_ok_));
+        completed_m7sel_ = m7sel_;
+        completed_frame_ready_ = true;
+      } else {
+        completed_frame_ready_ = false;
+      }
       chain_.a    = static_cast<int16_t>(le16(r + 3));
       chain_.b    = static_cast<int16_t>(le16(r + 5));
       chain_.c    = static_cast<int16_t>(le16(r + 7));
@@ -404,10 +617,22 @@ class M7Daemon {
       chain_.hofs = le16(r + 15) & 0x1FFF;
       chain_.vofs = le16(r + 17) & 0x1FFF;
       m7sel_ = r[19];
+      // snapshot this frame's record coverage, then re-arm the counters
+      cov_lines_last_   = cov_lines_;
+      cov_gap_last_     = cov_armed_ ? cov_gap_max_ : 0;
+      cov_lines_        = 0;
+      cov_gap_max_      = 0;
+      cov_armed_        = false;
+      cov_prev_line_    = -1;
+      wt_recs_last_     = wt_recs_;
+      wt_bytes_last_    = wt_bytes_;
+      wt_recs_          = 0;
+      wt_bytes_         = 0;
       if (pending_invalidate_) {
-        memset(line_ok_, 0, sizeof(line_ok_));
         pending_invalidate_ = false;
       }
+      memset(line_ok_, 0, sizeof(line_ok_));
+      next_shadow_line_ = 0;
       shadow_synced_ = true;
       ++syncs_;
       return;
@@ -422,41 +647,72 @@ class M7Daemon {
       }
     }
     if (line < M7_LINE_COUNT) {
+      FillShadowThrough(line);
       shadow_[line] = chain_;
       line_ok_[line] = true;
+      // Per-frame coverage diagnostics: records arrive in ascending line
+      // order within a frame, so a jump in the line number is a gap —
+      // records dropped by the FPGA ring (band displacement on screen).
+      // cov_lines_ counts records seen this frame; cov_gap_max_ the worst
+      // consecutive-run of missing lines. Snapshot at the 0xFE sync.
+      if (cov_armed_) {
+        const int gap = static_cast<int>(line) - cov_prev_line_ - 1;
+        if (gap > cov_gap_max_) cov_gap_max_ = gap;
+      }
+      cov_prev_line_ = line;
+      cov_armed_     = true;
+      ++cov_lines_;
+      next_shadow_line_ = line + 1;
       ++rec_lines_;
     }
   }
 
-  // Debug visualization: paint per-line register bytes as CLUT indices.
-  // Left half of each line = M7A[7:0], right half = M7D[7:0] — the HDMA
-  // perspective table shows as per-line colour bands that move every line
-  // while the game tilts. Lines never covered by a record stay at index 0.
-  //
-  // M7_TESTPAT=1 switches to a sawtooth probe: index = x within the row,
-  // xored with y so consecutive lines differ. Any displayed pixel that is
-  // NOT pattern(x,y) is leaked from elsewhere in the pipeline (native
-  // mux, stale slot, phase slip) and is immediately identifiable.
+  void FillShadowThrough(int line_exclusive) {
+    const int end = line_exclusive < static_cast<int>(M7_LINE_COUNT)
+                        ? line_exclusive
+                        : static_cast<int>(M7_LINE_COUNT);
+    while (next_shadow_line_ < end) {
+      shadow_[next_shadow_line_] = chain_;
+      line_ok_[next_shadow_line_] = true;
+      ++next_shadow_line_;
+    }
+  }
+
+  void ApplyVramRecord(const uint8_t *r, int len) {
+    if (len < 5) return;
+    const unsigned address = r[2] | (static_cast<unsigned>(r[3] & 0x7F) << 8);
+    const unsigned plane = r[3] >> 7;
+    const int data_len = len - 4;
+    uint8_t *dst = plane ? loc_v2_ : loc_v1_;
+    if (address + static_cast<unsigned>(data_len) > M7_VRAM_WORDS) return;
+    for (int i = 0; i < data_len; ++i) dst[address + i] = r[4 + i];
+    ++wt_recs_;
+    wt_bytes_ += static_cast<uint32_t>(data_len);
+  }
+
   bool testpat_ = getenv("M7_TESTPAT") != nullptr;
 
-  void FillRegViz(uint32_t slot) {
+  void RenderFrame(uint32_t slot) {
     volatile uint8_t *buf = reinterpret_cast<volatile uint8_t *>(pix_[slot]);
+    uint8_t rendered[M7_PIX_STRIDE];
     for (int y = 0; y < static_cast<int>(M7_LINE_COUNT); ++y) {
       volatile uint8_t *row = buf + y * M7_PIX_STRIDE;
       if (testpat_) {
         for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
           row[x] = static_cast<uint8_t>(x ^ y);
-        continue;
+      } else if (completed_line_ok_[y]) {
+        m7::render_line(completed_shadow_[y], y, completed_m7sel_, extbg_,
+                        loc_v1_, loc_v2_, rendered);
+        for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
+          row[x] = rendered[x];
+      } else {
+        for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
+          row[x] = 0;
       }
-      const uint8_t al = line_ok_[y]
-                             ? static_cast<uint8_t>(shadow_[y].a & 0xFF)
-                             : static_cast<uint8_t>(0);
-      const uint8_t dl = line_ok_[y]
-                             ? static_cast<uint8_t>(shadow_[y].d & 0xFF)
-                             : static_cast<uint8_t>(0);
-      for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x)
-        row[x] = (x < static_cast<int>(M7_PIX_STRIDE) / 2) ? al : dl;
     }
+    // Clean the rendered frame to DDR3 so the FPGA's fetch never races L2
+    // eviction (one syscall per frame; ~14k cache lines on the A9).
+    CacheFlush(buf, static_cast<size_t>(M7_LINE_COUNT) * M7_PIX_STRIDE);
   }
 
   bool WaitFrameSeqChange(uint32_t timeout_ms) {
@@ -466,66 +722,6 @@ class M7Daemon {
       if (hdr_[M7_HDR_FRAME_SEQ] != start) return true;
       if (now_ns() >= deadline) return false;
       sleep_ns(1000000ull);  // 1 ms poll
-    }
-  }
-
-  static void CopyPlane(volatile uint16_t *src, uint16_t *dst) {
-    for (uint32_t i = 0; i < M7_VRAM_WORDS; ++i) dst[i] = src[i];
-  }
-
-  // SNES VRAM is stored as two byte planes written by $2118/$2119 at the
-  // same word address: byte 2*w lives in plane 1, byte 2*w+1 in plane 2.
-  inline uint8_t VramByte(uint32_t word_addr, bool odd) const {
-    return odd ? static_cast<uint8_t>(loc_v2_[word_addr])
-               : static_cast<uint8_t>(loc_v1_[word_addr]);
-  }
-
-  void RenderLine(const M7Regs &r, int line, uint16_t *out) {
-    // Screen-space origin terms (pre-clip), then the affine transform.
-    const int cy_in = line + r.vofs - r.y;
-    const int cy_clip = mode7_clip(cy_in);
-    for (int x = 0; x < HD_PIXELS_PER_LINE; ++x) {
-      const int cx_in = (x / M7_HD_SCALE) + r.hofs - r.x;
-      const int cx_clip = mode7_clip(cx_in);
-
-      const int32_t tx = static_cast<int32_t>(r.a) * cx_clip +
-                         static_cast<int32_t>(r.b) * cy_clip;
-      const int32_t ty = static_cast<int32_t>(r.c) * cx_clip +
-                         static_cast<int32_t>(r.d) * cy_clip;
-      int map_x = (tx >> 8) + r.x;
-      int map_y = (ty >> 8) + r.y;
-
-      // Wrap into the 1024x1024 Mode 7 map/tile space (128x128 tiles).
-      const int wx = map_x & 0x3FF;
-      const int wy = map_y & 0x3FF;
-
-      // Tilemap entry: word address {tile_y[6:0], tile_x[6:0]}; the tile
-      // number is the entry's LOW byte, i.e. plane 1 at word w.
-      const uint32_t map_w = static_cast<uint32_t>((wy >> 3) * 128 + (wx >> 3));
-      const uint8_t tile = static_cast<uint8_t>(loc_v1_[map_w]);
-
-      // Tile pixel: word 0x2000 + tile*32 + row*4 + col/2; the byte is in
-      // plane 1 for even columns, plane 2 for odd columns.
-      const int col = wx & 7;
-      const int row = wy & 7;
-      const uint32_t tw =
-          0x2000u + tile * 32u + static_cast<uint32_t>(row) * 4u +
-          static_cast<uint32_t>(col >> 1);
-      const uint8_t px = VramByte(tw, col & 1);
-
-      if (extbg_) {
-        // EXTBG: the same pixel byte feeds both layers — bits 6:0 are the
-        // BG2 color index (palette +128) and bit 7 its priority; BG1 keeps
-        // the full 8-bit index.
-        const uint8_t bg2_idx = px & 0x7F;
-        const bool bg2_pri = px & 0x80;
-        if (bg2_idx != 0 && (bg2_pri || px == 0))
-          out[x] = bgr555_to_rgb565(loc_cg_[128 + bg2_idx]);
-        else
-          out[x] = bgr555_to_rgb565(loc_cg_[px]);
-      } else {
-        out[x] = bgr555_to_rgb565(loc_cg_[px]);
-      }
     }
   }
 
@@ -539,14 +735,8 @@ class M7Daemon {
   volatile uint16_t *regs_;
   volatile uint32_t *ctrl_;
   volatile uint16_t *pix_[2];
-  volatile uint16_t *vr1_;
-  volatile uint16_t *vr2_;
-  volatile uint16_t *cg_;
-
-  uint16_t loc_v1_[M7_VRAM_WORDS];
-  uint16_t loc_v2_[M7_VRAM_WORDS];
-  uint16_t loc_cg_[256];
-  uint16_t line_px_[HD_PIXELS_PER_LINE];
+  uint8_t loc_v1_[M7_VRAM_WORDS] = {};
+  uint8_t loc_v2_[M7_VRAM_WORDS] = {};
   uint16_t ready_seq_ = 0;
   uint32_t cur_pub_ = 0;   // buffer the last ctrl word points at
 
@@ -562,13 +752,86 @@ class M7Daemon {
   // reference, shadow_[line] is the last known value for that display line.
   M7Regs chain_ = {};
   M7Regs shadow_[M7_LINE_COUNT] = {};
+  M7Regs completed_shadow_[M7_LINE_COUNT] = {};
   bool line_ok_[M7_LINE_COUNT] = {};
+  bool completed_line_ok_[M7_LINE_COUNT] = {};
+  int next_shadow_line_ = 0;
   bool shadow_synced_ = false;
+  bool completed_frame_ready_ = false;
   bool pending_invalidate_ = false;
   uint8_t carry_[kRecMax] = {};
   int carry_len_ = 0;
   uint8_t m7sel_ = 0;
+  uint8_t completed_m7sel_ = 0;
+  bool vram_valid_ = false;
   uint8_t tel_drops_ = 0;
+
+  // VRAM resync dump lifecycle (P2c-3). dump_capable_ comes from the
+  // telemetry probe (byte 132 == 0xAA on pre-P2c-3 bitstreams); requests
+  // are cooldown-paced, stall-detected, and re-baselined by the 0xFB
+  // completion record.
+  static const uint64_t kDumpCooldownNs = 1000000000ull;  // between requests
+  // Paced full-resync cadence. A dump consumes only the line stream's
+  // slack (~2-6 s for both planes at the measured yield), so a 5 s
+  // interval keeps the daemon's VRAM image within ~one dump of live even
+  // for games that stream tiles continuously.
+  static const uint64_t kResyncIntervalNs = 5000000000ull;
+  uint64_t last_render_ns_ = 0;
+  uint64_t last_resync_ns_ = 0;
+  // Re-request backstop. Since the P2c-4 yield cap a dump consumes only the
+  // line stream's slack (~50 kB/s measured on device), so a full 2x32 KiB
+  // dump legitimately takes 2-6 s — the old 3 s timeout fired mid-dump and
+  // chained a follow-on request out of every dump, a storm all by itself.
+  static const uint64_t kDumpTimeoutNs  = 10000000000ull;
+  // Request -> clear-word spacing. Must exceed one FPGA ctrl poll period
+  // (~16 ms at 60 fps) so the request word is always adopted before the
+  // clear word overwrites it; short enough that the re-arm lands well
+  // before the ~0.3 s dump completes and the next request is due.
+  static const uint64_t kDumpClearDelayNs = 200000000ull;
+  bool dump_clear_pending_ = false;
+  uint64_t dump_clear_at_ns_ = 0;
+  bool dump_capable_     = false;
+  bool tel_probe_done_   = false;
+  bool dump_req_pending_ = false;  // want to publish a request
+  bool dump_requested_   = false;  // request published, awaiting 0xFB
+  uint64_t dump_req_last_ns_     = 0;
+  uint64_t dump_requested_at_ns_ = 0;
+  uint8_t  tel_dump_seq_  = 0;
+  uint8_t  tel_dm_        = 0;
+  uint16_t tel_rd_        = 0;
+  uint16_t tel_bc_        = 0;
+  uint16_t tel_bw_        = 0;
+  uint16_t tel_rcnt_      = 0;
+  uint16_t tel_vram1_ver_ = 0;
+  uint16_t tel_vram2_ver_ = 0;
+  uint16_t tel_wt_drops_  = 0;
+  uint32_t dumps_done_    = 0;
+  // per-frame record coverage + wt throughput (snapshot at each 0xFE sync)
+  int      cov_lines_ = 0, cov_gap_max_ = 0;
+  int      cov_prev_line_ = -1;
+  bool     cov_armed_ = false;
+  int      cov_lines_last_ = 0, cov_gap_last_ = 0;
+  uint32_t wt_recs_ = 0, wt_bytes_ = 0;
+  uint32_t wt_recs_last_ = 0, wt_bytes_last_ = 0;
+  // 0xFB-loss watchdog v2: fb_seq_seen_ is the last dump_seq confirmed by a
+  // completion record. fb ADVANCING between telemetry slots resets the
+  // mismatch counter — records are flowing, whatever the tel/fb spacing
+  // (under continuous re-dumping tel legitimately sits one dump ahead
+  // indefinitely). The alarm counts only while fb is FROZEN and tel runs
+  // ahead with no dump outstanding. The grace must exceed the WORST
+  // legitimate FB lag, not the average: the 0xFB trails its own dump's
+  // ~274 chunk records, and since the P2c-4 yield cap a dump consumes
+  // only the line stream's slack (~30 kB/s), stretching to ~2 s — while a
+  // dump is outstanding dump_requested_ gates the counter off, so the
+  // alarm only sees the gap AFTER a dump where no new request exists:
+  // frozen fb then means the request was swallowed (wedged FSM) or the
+  // record truly lost. Telemetry slots arrive at ~17/s (1-in-64 payloads,
+  // ~1100 payloads/s — P2c-4 cadence, matched to the RTL), so 40 slots
+  // ≈ 2.3 s. The 3 s stall timeout covers the rest.
+  static const int kFbMissTelSamples = 40;
+  uint8_t fb_seq_seen_      = 0;
+  uint8_t fb_seq_prev_      = 0;
+  uint8_t tel_seq_mismatch_ = 0;
   uint32_t crc_bad_seen_ = 0;
   uint32_t syncs_ = 0;
   uint32_t rec_lines_ = 0;

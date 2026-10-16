@@ -34,6 +34,18 @@ TAIL = 63            # [63] 0x5A magic
 DISP_ROW = 128       # [128] row id in the displayed linebuf slot
 LAST_ROW = 129       # [129] row id sitting complete in the inactive slot
 SWAP = 130           # [130] {row_adv, act, 6'b0}
+# P2c-3: VRAM resync dump channel (0xAA fill on pre-P2c-3 bitstreams)
+DUMP_PHASE = 132     # [132] {arm, dstat_pend, dump_pend, dump_last,
+                     #       dump_active, dump_plane, 2'b0}
+DUMP_SEQ = 133       # [133] completed dump counter (8-bit wrap)
+VRAM1_VER = 134      # [134..135] plane-1 write-through version
+VRAM2_VER = 136      # [136..137] plane-2 write-through version
+WT_DROPS = 138       # [138..139] write-through drop count
+# P2c-3 dump diagnostics (instrumentation build)
+DUMP_RD = 140        # [140..141] dump read pointer (plane-local byte addr)
+DUMP_BC = 142        # [142..143] bytes landed in the in-progress chunk
+BW_CNT = 144         # [144..145] dump byte-window cycles ever
+REC_FILL = 146       # [146..147] record FIFO fill level
 
 def crc8(data, c=0):
     for b in data:
@@ -73,7 +85,11 @@ def ranges(bits):
 
 def show(seq, p, label):
     if p[HEAD] != 0xC3:
-        # mode 3 record payload: len-prefixed per-line register records
+        # mode 3 record payload: len-prefixed records; line 0xFE = full
+        # sync, 0xFD/0xFC = VRAM dump chunk / write-through run, 0xFB =
+        # dump-done status (P2c-3). Payload slices may start mid-record;
+        # such slices decode as garbage here (the daemon reassembles the
+        # true stream across payload boundaries).
         recs, i, n = [], 0, len(p)
         while i < n:
             ln = p[i]
@@ -84,9 +100,14 @@ def show(seq, p, label):
             if ln == 0:
                 break
         full = sum(1 for ln_, m_, _ in recs if ln_ == 0xFE)
-        lines = sum(1 for ln_, m_, _ in recs if ln_ != 0xFE)
+        dump = sum(1 for ln_, m_, _ in recs if ln_ == 0xFD)
+        wt = sum(1 for ln_, m_, _ in recs if ln_ == 0xFC)
+        done = sum(1 for ln_, m_, _ in recs if ln_ == 0xFB)
+        lines = sum(1 for ln_, m_, _ in recs
+                    if ln_ not in (0xFE, 0xFD, 0xFC, 0xFB))
         print(f"  [{label}] RECORD payload: records={len(recs)} "
-              f"(sync={full} lines={lines}), first={recs[:4]}")
+              f"(sync={full} lines={lines} vram_dump={dump} vram_wt={wt} "
+              f"dump_done={done}), first={recs[:4]}")
         return
     if p[TAIL] != 0x5A:
         print(f"  [{label}] BAD MAGIC head={p[HEAD]:02X} tail={p[TAIL]:02X}")
@@ -118,6 +139,18 @@ def show(seq, p, label):
     print(f"    swap: disp_row={p[DISP_ROW]} last_row={p[LAST_ROW]} "
           f"row_adv={(p[SWAP]>>7)&1} act={(p[SWAP]>>6)&1} "
           f"rec_drops={p[131]}")
+    dp = p[DUMP_PHASE]
+    if dp == 0xAA:
+        print("    p2c3: pre-P2c-3 bitstream (bytes 132+ are 0xAA fill) — "
+              "no dump channel")
+    else:
+        print(f"    p2c3: dump phase=arm={(dp>>7)&1} dstat_pend={(dp>>6)&1} "
+              f"pend={(dp>>5)&1} last={(dp>>4)&1} active={(dp>>3)&1} "
+              f"plane={(dp>>2)&1} seq={p[DUMP_SEQ]} "
+              f"vram_ver=({u16(VRAM1_VER)},{u16(VRAM2_VER)}) "
+              f"wt_drops={u16(WT_DROPS)}")
+        print(f"    dumpdiag: rd={u16(DUMP_RD)} bc={u16(DUMP_BC)} "
+              f"bw_cnt={u16(BW_CNT)} rec_fill={u16(REC_FILL)}")
     print(f"    ctrl_read=0x{u32(CTRL_DATA):08X} (expect 0x00020001 = seq1|buf0|FMT8) "
           f"last_seq_adopted={u16(LAST_SEQ):04X} dm_word_lo=0x{u32(DM_WORD):08X}")
 

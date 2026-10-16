@@ -61,12 +61,18 @@ at the same word address**: VRAM byte `2*w` is plane 1 word `w`, VRAM byte
 |---|---|---|
 | 15:0 | `READY_SEQ` | daemon increments on every published frame |
 | 16 | `READY_BUF` | buffer the daemon just finished rendering |
-| 17 | `DUMP_REQ` | **dead since REVISION v2** — the FPGA never reads it (no dump machinery); keep 0 |
-| 31:18 | — | zero |
+| 17 | `FMT8` | pixel buffers hold 8bpp CLUT indices (ctrl word v2 — MUST be 1) |
+| 18 | `DUMP_REQ` | request a VRAM resync dump (REVISION v5) |
+| 31:19 | — | zero |
 
-**Bits [31:17] must be zero.** The FPGA rejects a ctrl word with any of
-them set as boot-time DDR3 garbage (there is no header magic anymore, so
-this zero-check is the only sanity gate on the word).
+**Bits [31:19] must be zero and `FMT8` must be 1.** The FPGA rejects a
+ctrl word otherwise, as boot-time DDR3 garbage (there is no header magic
+anymore, so this check is the only sanity gate on the word). Note bit 18
+lives *inside* the old "reserved" span — the adoption mask narrowed from
+`[31:17]` to `[31:19]` in REVISION v5; bit-18-set words from a pre-v5
+bitstream are rejected there and vice versa a v5 daemon must not publish
+to a pre-v5 bitstream expecting dumps (the daemon's telemetry probe
+handles that).
 
 > **Superseded by ctrl word v2 — see REVISION v3 below** (`FMT8` now lives
 > at bit 17; `DUMP_REQ` moved to bit 18).
@@ -263,3 +269,162 @@ keeps the link quiet when nothing changes).
 - Debug visualization (current build): each display line paints `A[7:0]`
   as the left-half CLUT index and `D[7:0]` as the right half — the HDMA
   perspective table appears as per-line colour bands.
+
+# REVISION v5 — VRAM resync dump + write-through records on the stream (2026-10-16, P2c-3)
+
+The record byte stream gains three VRAM opcodes in the LINE byte (values
+outside 0..223 are opcodes), and the ctrl word gains a live `DUMP_REQ`
+(bit 18). Together they close the loop that lets the daemon hold an
+accurate local copy of Mode 7 VRAM:
+
+## VRAM records
+
+Address fields are **plane-local dpram byte addresses** (= VRAM word
+index — daemon `loc_v1_`/`loc_v2_` arrays index them directly). `ah`
+bit 7 = plane (0 = plane 1, 1 = plane 2), `ah[6:0]` = `addr[14:8]`;
+`al` = `addr[7:0]`. Data bytes are consecutive addresses from `addr`.
+
+| Record | Layout | Notes |
+|---|---|---|
+| `0xFD` dump chunk | `[len][FD][al][ah][data...]` | len=244 (240 data); short tail len=132 (128 data) at the 32 KiB plane end |
+| `0xFC` write-through run | `[len][FC][al][ah][data...]` | len=4+N, N≤8; coalesced same-plane consecutive VRAM writes snooped from the PPU port |
+| `0xFB` dump done | `[5][FB][seq][wt_drops l h]` | seq = completed-dump counter; wt_drops = current drop count |
+
+Length budget: line/sync ≤ 20, WT ≤ 12, dump 244/132, pad 0x00. A
+boundary len byte is therefore **never 0xC3**: `payload[0]==0xC3` with
+the parser at a record boundary is a telemetry slot, unambiguously.
+Mid-record (partial record carried across payloads) the first payload
+byte is arbitrary data — receivers must keep feeding such payloads to
+the record parser (the FPGA pauses record drain during telemetry slots
+and resumes afterwards; no record bytes are ever consumed by a telemetry
+payload).
+
+## Dump protocol
+
+- **Request**: daemon publishes a ctrl word with `DUMP_REQ` set (bit 18)
+  and a bumped `READY_SEQ`. The FPGA consumes the bit when it adopts the
+  word while idle (not dumping, nothing pending, not clearing RAM), then
+  re-arms its trigger the next time it sees the bit clear. The daemon
+  sets the bit for exactly one publish per request.
+- **Transfer**: the FPGA hijacks port B of the plane being dumped, only
+  inside vblank and never during RAM clear, paced by record-FIFO
+  backpressure. A full 2×32 KiB dump takes ~17 frames at 3 Mbaud.
+- **Completion**: the `0xFB` status record (in-band) and telemetry
+  `dump_seq`++ (sideband).
+- **Pacing (daemon)**: requests are cooldown-paced (≥1 s apart); a dump
+  that doesn't complete within 3 s is re-requested. *(Superseded by v6:
+  10 s timeout — yield-capped dumps legitimately take 2-6 s — plus a
+  5 s paced full-resync while rendering.)*
+- **Drift triggers**: telemetry `wt_drops` advancing by ≥4 (dropped
+  write-through runs ⇒ the local image has holes) or any CRC-failed
+  payload ⇒ hold publishing (`vram_valid_` cleared) and request a
+  fresh dump. `0xFB` re-baselines the drop counter. *(Superseded by v6:
+  the drift detector is DISABLED — the 16-bit `wt_drops` telemetry reads
+  tear on the HPS UART (high byte unstable by ±32k, a counter observed
+  frozen across 10 s while requests cycled), so the trigger fired
+  spuriously. CRC-failed payloads still invalidate the stream via the
+  framing layer.)*
+- **Capability probe**: pre-P2c-3 bitstreams fill telemetry bytes 132+
+  with `0xAA`. The daemon classifies the bitstream from the first
+  telemetry frame and never sends dump requests to one that can't
+  answer.
+
+## Telemetry additions (payload[0]==0xC3 slots)
+
+| Byte | Content |
+|---|---|
+| 132 | `{dump_req_arm, dstat_pend, dump_pend, dump_last, dump_active, dump_plane, 2'b00}` |
+| 133 | completed-dump counter (wraps) |
+| 134–135 | plane-1 write-through version (l,h) |
+| 136–137 | plane-2 write-through version (l,h) |
+| 138–139 | write-through drop count (l,h) |
+| 140–141 | dump read pointer `dump_rd` (l,h) — v6 diag block |
+| 142–143 | dump byte counter `dump_bc` (l,h) |
+| 144–145 | record byte-rate `bw_cnt` (l,h) |
+| 146–147 | record FIFO fill `rec_count` (l,h) |
+| 148–255 | `0xAA` fill *(bytes 140–147 were `0xAA` in P2c-3; the v6 diag block reuses them)* |
+
+## Receiver contract (daemon, P2c-3)
+
+- Records `0xFD`/`0xFC` write their data bytes into the plane-local byte
+  array at `addr` (bounds-checked); `0xFB` with len==5 marks the image
+  valid and re-baselines `wt_drops`.
+- Rendering publishes only when the per-line register frame is complete
+  **and** the VRAM image is valid (initial `0xFB` received, no drift
+  since).
+
+# REVISION v6 — storm fixes, yield cap, paced resync, renderer VRAM model (2026-10-17, P2c-4)
+
+Four on-device failure modes found and fixed, plus the daemon-side
+renderer fix that turned the stream into a picture. No ABI field
+changes; behavior, cadence and pacing all move.
+
+## Channel cadence
+
+Telemetry interleaving moves from 1-in-16 to **1-in-64** payload slots
+(`m7_reg_stream.sv slot_cnt` widened to 8 bits). The measured channel
+budget per line period (~1364 clk_sys) is ~18 B; telemetry at 6.25 %
+of it starved line records. At 63/64 the record path gets ~278 KB/s of
+the 3 Mbaud link. The daemon watchdog grace is matched to the new
+cadence (40 telemetry slots ≈ 2.3 s at ~17 slots/s).
+
+## Ctrl adoption + dump trigger (RTL)
+
+The dump-FSM's arm path reacted to bare `ctrl_new` — which pulses once
+per ctrl poll, every frame, changed word or not — so stale/garbage
+captures with `DUMP_REQ` set fired random dumps. Now the adoption branch
+(only reached for words that pass the reserved-zero + `FMT8` + new-seq
+guard) drives a one-shot `dump_fire` with an explicit arm/disarm latch
+(`dump_req_arm`); the FSM only consumes the pulse.
+
+## Dump yield + completion priority (RTL)
+
+Dump chunks previously staged whenever the record FIFO had 268 bytes
+free — they monopolized the channel and per-frame line coverage
+collapsed to 0/224 during dumps. Now:
+
+- **Yield cap**: a chunk stages only while `rec_count < 40` (at most one
+  chunk in flight in the ring). Dumps consume only the line stream's
+  slack — measured ~4 chunks (960 B) per frame, a full 2×32 KiB dump in
+  ~2-6 s, with line coverage holding 160-172/224 throughout.
+- **`0xFB` completion outranks chunks**: the dstat branch moved above
+  the chunk branch in the push sequencer (a lagging completion record
+  used to stall the dump lifecycle for seconds).
+- **Stall abort**: if the dump FSM makes no progress (no chunk staged,
+  nothing pending) for ~2^22 clk_sys (~195 ms), it abandons the dump
+  (clears `dump_active`/`dump_pend`). This is the kill-time wedge fix:
+  a daemon killed mid-dump used to leave `dump_active` set forever and
+  every later request was swallowed until a core reload.
+
+## Daemon dump lifecycle
+
+- **Timeout 3 s → 10 s**: yield-capped dumps legitimately take 2-6 s;
+  the old timeout re-requested mid-dump and chained dumps by itself.
+- **Watchdog v3**: the `0xFB` record stages `dump_seq` at push *start*
+  while the FPGA increments the counter at push *completion* — so
+  `tel == fb + 1` is the healthy steady state by construction. The
+  comparison is bias-corrected (`tel - 1 - fb`); a genuine loss (no `fb`
+  advance for 40 telemetry slots while idle) is diagnostic + recovery
+  (re-request), never invalidation.
+- **Drift detector disabled** (see v5 supersession above).
+- **Paced periodic resync**: stream-heavy games (SMK streams map tiles
+  every frame) outrun the write-through channel for good — the daemon
+  receives ~1-byte `0xFC` fragments and its image goes stale. While the
+  renderer is publishing, a full-resync dump is re-requested every 5 s
+  (bounded replacement for the accidental storm resync; the yield cap
+  keeps line coverage alive during it).
+- **Renderer VRAM model fixed**: Mode 7 fetches are *flat byte*
+  addresses — character data at flat `0x0000-0x3FFF`, tilemap at flat
+  `0x4000-0x7FFF` — and flat byte `b` lives in plane `b & 1` at word
+  `b >> 1` (the plane-local address the records carry). The old model
+  (plane 1 = tilemap array, plane 2 = pixel array at the same word
+  index) rendered solid-color tiles correctly by accident and turned
+  every detailed tile into per-pixel noise. This fix is what made real
+  game content appear; the record addressing itself was always right.
+
+## Status line instrumentation (daemon)
+
+The 5 s status line now carries `cov=` (per-frame delivered line-record
+count /224, max gap) decoded from the record stream itself, and
+`wt=` (write-through records/bytes received per frame) — the numbers
+that turned every remaining ambiguity above into decodable data.

@@ -68,7 +68,9 @@ fi
 	exit 1
 }
 
-PROJECT_REVISION="$(sed -n 's/^PROJECT_REVISION = "\([^"]*\)"/\1/p' "$QPF_FILE")"
+# tr -d '\r': the qpf sometimes carries CRLF endings; a stray CR in the
+# revision name makes every later "$PROJECT_REVISION.rbf" path a lie.
+PROJECT_REVISION="$(sed -n 's/^PROJECT_REVISION = "\([^"]*\)"/\1/p' "$QPF_FILE" | tr -d '\r')"
 [[ -n "$PROJECT_REVISION" ]] || {
 	echo "Could not determine PROJECT_REVISION from $QPF_FILE" >&2
 	exit 1

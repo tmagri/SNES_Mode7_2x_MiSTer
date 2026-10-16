@@ -38,6 +38,7 @@ module emu
 	output [3:0]  M7_SCALE,
     output        HD_PIXEL_VALID,
     output [23:0] HD_PIXEL_IN,
+	output        HD_PIXEL_OPAQUE,
     output        HD_LINE_ARMED,
 	input         HD_PX_STROBE,
 
@@ -634,6 +635,7 @@ wire [7:0]  m7sel_out;
 wire [8:0]  x_out;
 wire        frame_out;      // PPU BG strobe — NOT a frame boundary (unused, see M7 block)
 wire [23:0] hd_pixel_in;
+wire        hd_pixel_opaque;
 wire        hd_px_valid;
 wire        hd_line_armed;
 wire        vblank_out;     // PPU IN_VBL — true vblank level (frame boundary)
@@ -653,6 +655,7 @@ localparam [3:0] m7_scale_wire = M7_HD_SCALE;
 assign M7_SCALE       = m7_scale_wire;
 assign HD_PIXEL_VALID = hd_px_valid;
 assign HD_PIXEL_IN    = hd_pixel_in;
+assign HD_PIXEL_OPAQUE = hd_pixel_opaque;
 assign HD_LINE_ARMED  = hd_line_armed;
 
 // HD scanline buffer (v4, 2-slot row ping-pong, 8bpp + CLUT). Port A
@@ -682,6 +685,7 @@ hd_mode7_linebuf linebuf (
     .fetch_en(m7_fetch_en),
     .rd_slot(act),
     .hd_pixel_out(hd_pixel_in),
+	.hd_pixel_opaque(hd_pixel_opaque),
     .hd_px_valid(hd_px_valid),
     .hd_line_armed(hd_line_armed)
 );
@@ -692,8 +696,10 @@ hd_mode7_linebuf linebuf (
 assign M7_SCALE       = 4'd1;
 assign HD_PIXEL_VALID = 1'b0;
 assign HD_PIXEL_IN    = 24'd0;
+assign HD_PIXEL_OPAQUE = 1'b0;
 assign HD_LINE_ARMED  = 1'b0;
 assign hd_pixel_in    = 24'd0;
+assign hd_pixel_opaque = 1'b0;
 assign hd_px_valid    = 1'b0;
 `endif
 
@@ -1756,15 +1762,131 @@ reg [15:0] arm_cnt = 16'd0;   // lines armed HD this frame (arm block)
 // their consumers move to the UART stream in P2c (kept so the snoop logic
 // is already in its final shape).
 reg  [15:0] vram1_ver = 16'd0, vram2_ver = 16'd0, wt_drops = 16'd0;
+reg  vram1_we_d = 1'b1, vram2_we_d = 1'b1;  // WE edge detect (idle high)
 
-// The v1 VRAM resync-dump-over-DDR3 machinery is gone with the mailbox
-// writer (P2c re-ships VRAM/CGRAM over the UART instead). The VRAM port-B
-// dump mux inputs (wires declared near the VRAM port above) are tied off
-// so the fetch path is unconditional.
-assign dump_a_p1 = 1'b0;
-assign dump_a_p2 = 1'b0;
-assign dump_addr = 15'd0;
-wire dump_busy = 1'b0;
+// ===========================================================================
+// P2c-3: VRAM resync dump + write-through records over the UART stream.
+//
+// The daemon sets M7_CTRL_DUMP_REQ in its ctrl word; this FSM then streams
+// both VRAM planes to it as record-opcode messages on the existing record
+// stream (the DDR3 dump path died with the mailbox writer):
+//   0xFD [len][FD][al][ah][data...]  240-byte resync chunk (short tail at
+//                                    the 32 KiB plane end), ah bit7 = plane
+//   0xFC [len][FC][al][ah][data...]  same-plane consecutive write-through
+//                                    run coalesced from the wt_fifo snoop
+//   0xFB [5][FB][seq][wt_drops l h]  dump complete; wt_drops is the
+//                                    daemon's new corruption baseline
+// Port B of the plane being dumped is hijacked ONLY inside vblank (the PPU
+// never fetches there) and never while a ROM load is clearing RAM; reads
+// are paced by backpressure (one staged chunk max) so the dump takes ~17
+// frames at the UART drain rate and the PPU never notices.
+// Room policy: a record is staged only when the record FIFO can absorb it
+// whole (single-pusher invariant makes that guarantee hold).
+// ===========================================================================
+reg         dump_active = 1'b0;
+reg         dump_plane = 1'b0;      // 0 = plane 1, 1 = plane 2
+reg  [15:0] dump_rd = 16'd0;        // next plane-local byte address to present
+reg  [8:0]  dump_bc = 9'd0;         // bytes buffered for the in-progress chunk
+reg  [7:0]  dump_seq = 8'd0;        // completed dumps (telemetry + 0xFB record)
+reg         dump_pend = 1'b0;       // staged chunk awaiting the push block
+reg         dstat_pend = 1'b0;      // staged 0xFB awaiting the push block
+reg         dump_last = 1'b0;       // staged chunk was plane 2's tail
+reg         dump_req_arm = 1'b1;    // DUMP_REQ must clear between dumps
+// One-shot request flag, OWNED by the ctrl-adoption block (set inside the
+// guarded adopted-word branch, cleared on dump_fire_ack). The dump FSM only
+// reads it — two drivers here would be an elaboration error (see
+// fetch_restart). Replaces direct ctrl_new reaction: ctrl_new pulses once
+// per POLL (every frame, changed word or not), so reacting there fired
+// dumps off stale/garbage captures.
+reg         dump_fire = 1'b0;
+reg  [21:0] dump_stall = 22'd0;     // cycles since the last staged chunk
+reg  [7:0]  dp_len, dp_op, dp_b2, dp_b3;   // staged chunk header bytes
+reg  [15:0] bw_cnt = 16'd0;         // DIAG: total dump_byte_win cycles ever
+reg         dump_presented_d;
+reg         dbuf_we;
+reg  [7:0]  dbuf_wa, dbuf_wd, dbuf_ra;
+reg  [7:0]  chunk_buf_q;
+reg  [7:0]  chunk_buf [0:255];      // 1 M10K: decouples vblank-bounded reads
+                                    // from the UART-paced record push
+
+// write-through record staging (owned here; wt_w/version snoop stays in the
+// frame-controller block below, which never touches these)
+reg         wt_pend = 1'b0;
+reg  [3:0]  wt_n = 4'd0;            // entries in the staged run (1..8)
+reg  [3:0]  wt_base = 4'd0;         // wt_r at scan time
+reg  [7:0]  wt_al, wt_ah;
+
+wire [10:0] rec_count;              // record FIFO fill level (stream export)
+
+// dump_bc counts PRESENTED bytes, which land one cycle after the issue the
+// gate evaluates — so the window must close while bc still reads 239 to
+// issue exactly 240 bytes (with `bc < 240` a 241st byte slips in, bc lands
+// at 241, and stage_chunk's (bc==240 || rd_end) matches neither => the dump
+// freezes forever with active=1; found via the bw_cnt=rd=bc=241 telemetry).
+wire dump_byte_win = dump_active && !dump_pend && !dstat_pend &&
+                     !clearing_ram && vblank_out &&
+                     (dump_bc < 9'd239) && (dump_rd != 16'h8000);
+// set on the first presentation of a chunk, cleared at staging: marks that
+// the in-flight chunk owns partial bytes
+reg chunk_active = 1'b0;
+assign dump_a_p1 = dump_byte_win & ~dump_plane;
+assign dump_a_p2 = dump_byte_win &  dump_plane;
+assign dump_addr = dump_rd[14:0];
+wire [7:0] dump_qb = dump_plane ? VRAM2_Q_B : VRAM1_Q_B;
+
+wire [15:0] chunk_base = dump_rd - {8'd0, dump_bc};
+wire dump_rd_end = (dump_rd == 16'h8000);
+// staged only once the last BRAM write has landed (two-cycle read->write
+// pipeline: presented_d raises the write, dbuf_we fires the array port).
+// NO FIFO-room term here on purpose: staging resets dump_bc, so a blocked
+// stage leaves byte_win dead (bc==240) with no retry pressure; the room
+// invariant lives entirely on the push branch, and byte_win's !dump_pend
+// provides the backpressure that paces the dump.
+// Third term: vblank ended mid-chunk. The window is vblank-gated, so a
+// chunk truncated at bc==239 sits EXACTLY on the gate's bound — the window
+// can never resume (needs bc<239) and stage (needs bc==240) never fires:
+// the dump wedges forever with active=1 and blocks every later dump
+// (observed on device: rd=bc=bw=30239, 125 clean chunks then dead). Ship
+// the truncated tail instead — the daemon accepts short chunks, and
+// chunk_base = rd - bc resumes the next vblank at the right address.
+wire stage_chunk = dump_active && !dump_pend && !dump_presented_d && !dbuf_we &&
+                   ((dump_bc == 9'd240) ||
+                    (dump_rd_end && (dump_bc != 9'd0)) ||
+                    (chunk_active && !vblank_out && (dump_bc != 9'd0)));
+
+// coalescing scan: longest prefix of wt_fifo entries that write consecutive
+// addresses in the same plane (the FIFO is 8 deep, so runs cap at 8).
+// Entries are {plane, addr[14:0], data[7:0]} — snoop pushes in the frame
+// controller block, this block retires.
+reg [23:0] wt_fifo [0:7];
+reg [3:0]  wt_w = 4'd0, wt_r = 4'd0;
+wire [3:0] wt_cnt = wt_w - wt_r;
+wire [23:0] wt_e0 = wt_fifo[wt_r[2:0]];
+wire [23:0] wt_e1 = wt_fifo[(wt_r + 4'd1) & 4'd7];
+wire [23:0] wt_e2 = wt_fifo[(wt_r + 4'd2) & 4'd7];
+wire [23:0] wt_e3 = wt_fifo[(wt_r + 4'd3) & 4'd7];
+wire [23:0] wt_e4 = wt_fifo[(wt_r + 4'd4) & 4'd7];
+wire [23:0] wt_e5 = wt_fifo[(wt_r + 4'd5) & 4'd7];
+wire [23:0] wt_e6 = wt_fifo[(wt_r + 4'd6) & 4'd7];
+wire [23:0] wt_e7 = wt_fifo[(wt_r + 4'd7) & 4'd7];
+wire wt_c01 = (wt_e1[23] == wt_e0[23]) && (wt_e1[22:8] == wt_e0[22:8] + 15'd1);
+wire wt_c12 = wt_c01 && (wt_e2[23] == wt_e1[23]) && (wt_e2[22:8] == wt_e1[22:8] + 15'd1);
+wire wt_c23 = wt_c12 && (wt_e3[23] == wt_e2[23]) && (wt_e3[22:8] == wt_e2[22:8] + 15'd1);
+wire wt_c34 = wt_c23 && (wt_e4[23] == wt_e3[23]) && (wt_e4[22:8] == wt_e3[22:8] + 15'd1);
+wire wt_c45 = wt_c34 && (wt_e5[23] == wt_e4[23]) && (wt_e5[22:8] == wt_e4[22:8] + 15'd1);
+wire wt_c56 = wt_c45 && (wt_e6[23] == wt_e5[23]) && (wt_e6[22:8] == wt_e5[22:8] + 15'd1);
+wire wt_c67 = wt_c56 && (wt_e7[23] == wt_e6[23]) && (wt_e7[22:8] == wt_e6[22:8] + 15'd1);
+wire [3:0] wt_run = wt_c67 ? 4'd8 :
+                    wt_c56 ? 4'd7 :
+                    wt_c45 ? 4'd6 :
+                    wt_c34 ? 4'd5 :
+                    wt_c23 ? 4'd4 :
+                    wt_c12 ? 4'd3 :
+                    wt_c01 ? 4'd2 : 4'd1;
+// a 68-byte wt record needs 68 free slots; dump chunks (244) get their own
+// tighter gate so a chunk can never be staged into a FIFO that fits only
+// line-sized records
+wire wt_stage = (wt_r != wt_w) && !wt_pend && (rec_count < 11'd445);
 
 // HD fetch gating — quasi-static (changes at frame granularity at most)
 wire m7_fetch_en = daemon_present;
@@ -1785,14 +1907,25 @@ wire m7_fetch_en = daemon_present;
 reg         rec_hd_d;
 reg         rec_run  = 1'b0;
 reg         sync_pend = 1'b0;
-reg  [4:0]  rec_step;
-reg  [4:0]  rec_len;
+reg  [7:0]  rec_step;               // 8-bit: dump chunks run to step 243
+reg  [7:0]  rec_len;
 reg  [7:0]  rec_line_b;
 reg  [7:0]  rec_mask_b;
 reg  [8:0]  rec_rm;                 // walking value mask (bit8 = M7SEL)
 reg         rec_wr = 1'b0;          // one-cycle push into m7_reg_stream
 reg  [7:0]  rec_data;
 reg  [7:0]  rec_sel_b;
+// record source modes: P2c-2 line/sync deltas plus the P2c-3 VRAM records.
+// rec_mode/rec_done are push-block-owned; the dump/wt emitter reads them
+// for its handshakes.
+localparam [1:0] RM_LINE = 2'd0, RM_DCHUNK = 2'd1, RM_DSTAT = 2'd2, RM_WT = 2'd3;
+reg  [1:0]  rec_mode = RM_LINE;
+reg         rec_done = 1'b0;        // one-cycle pulse at a record's last byte
+reg  [7:0]  rec_ah_b;               // 3rd header byte of VRAM records
+reg  [3:0]  rec_wt_base;            // staged copy of wt_base for data steps
+reg  [3:0]  rec_wt_n;               // staged copy of wt_n: retire exactly the
+                                    // entries this record pushed, immune to a
+                                    // newer scan overwriting wt_n mid-record
 reg  [15:0] rc_a, rc_b, rc_c, rc_d; // last captured line's values (reference)
 reg  [12:0] rc_x, rc_y, rc_h, rc_v;
 reg  [7:0]  rec_drops = 8'd0;       // records dropped for FIFO room
@@ -1836,65 +1969,249 @@ always @(*) begin
     endcase
 end
 
-// Record push sequencer. Pushes are 1 byte/cycle; a line's record finishes
-// long before the next hde fall. If the FIFO runs out of room the record is
-// dropped whole (the next frame's 0xFE full sync repairs the daemon).
+// Record payload byte at each step. Common header: [len][opcode][b2] with
+// [b3] appended for the VRAM records; the tail is mode-specific.
+wire [7:0] rec_mode_data =
+    (rec_mode == RM_LINE)   ? rm_val :
+    (rec_mode == RM_DCHUNK) ? chunk_buf_q :
+    (rec_mode == RM_DSTAT)  ? ((rec_step == 8'd4) ? wt_drops[15:8] : rec_ah_b) :
+                              wt_fifo[(rec_wt_base[2:0] + rec_step[2:0] + 3'd4)][7:0];
+
+// Record push sequencer (sole driver of rec_wr). Pushes are 1 byte/cycle.
+// Priority: per-frame sync > per-line delta (render-critical) > dump chunk
+// > dump status > write-through run. If the FIFO runs out of room a line
+// record is dropped whole (the next frame's 0xFE full sync repairs the
+// daemon); VRAM records are never staged without room, so they always
+// complete once started.
 // (vbl_d is driven here since the old shared block was deleted with the
 // ml_* capture; frame_start above samples it.)
 always @(posedge clk_sys) begin
     rec_wr   <= 1'b0;
+    rec_done <= 1'b0;
     rec_hd_d <= HBlank_out;
     vbl_d    <= vblank_out;
+    dbuf_ra  <= 8'd0;
 
     if (rec_run) begin
         rec_wr   <= 1'b1;
-        rec_data <= (rec_step == 5'd0) ? rec_len :
-                    (rec_step == 5'd1) ? rec_line_b :
-                    (rec_step == 5'd2) ? rec_mask_b : rm_val;
-        // hi byte of each value pair consumed one walked field
-        rec_rm   <= (rec_step >= 5'd4 && !rec_step[0])
-                    ? (rec_rm & (rec_rm - 9'd1)) : rec_rm;
-        rec_step <= rec_step + 5'd1;
-        if (rec_step == rec_len - 5'd1)
-            rec_run <= 1'b0;
+        rec_data <= (rec_step == 8'd0) ? rec_len :
+                    (rec_step == 8'd1) ? rec_line_b :
+                    (rec_step == 8'd2) ? rec_mask_b :
+                    (rec_mode != RM_LINE && rec_step == 8'd3) ? rec_ah_b :
+                    rec_mode_data;
+        // hi byte of each value pair consumed one walked field (line records
+        // only — the other modes don't use the mask walk)
+        if (rec_mode == RM_LINE && rec_step >= 8'd4 && !rec_step[0])
+            rec_rm <= (rec_rm & (rec_rm - 9'd1));
+        // chunk data read: address presented at step s yields buf[s-3] one
+        // cycle later, which is exactly the byte pushed at step s
+        if (rec_mode == RM_DCHUNK)
+            dbuf_ra <= rec_step - 8'd3;
+        rec_step <= rec_step + 8'd1;
+        if (rec_step == rec_len - 8'd1) begin
+            rec_run  <= 1'b0;
+            rec_done <= 1'b1;
+        end
     end else if (sync_pend || frame_start) begin
         sync_pend  <= 1'b0;
-        rec_len    <= 5'd20;
+        rec_len    <= 8'd20;
         rec_line_b <= 8'hFE;
         rec_mask_b <= 8'hFF;
+        rec_mode   <= RM_LINE;
         rec_rm     <= 9'h1FF;
         rec_sel_b  <= m7sel_out;
         rec_run    <= 1'b1;
-        rec_step   <= 5'd0;
+        rec_step   <= 8'd0;
         rc_a <= m7a_out;    rc_b <= m7b_out;
         rc_c <= m7c_out;    rc_d <= m7d_out;
         rc_x <= m7x_out;    rc_y <= m7y_out;
         rc_h <= m7hofs_out; rc_v <= m7vofs_out;
     end else if (~HBlank_out & rec_hd_d && !vblank_out && (ppu_y < 9'd224)) begin
         if (cur_mask != 8'd0 && rec_room) begin
-            rec_len    <= 5'd3 + {popcnt8(cur_mask), 1'b0};
+            rec_len    <= 8'd3 + {popcnt8(cur_mask), 1'b0};
             rec_line_b <= ppu_y[7:0];
             rec_mask_b <= cur_mask;
+            rec_mode   <= RM_LINE;
             rec_rm     <= {1'b0, cur_mask};
             rec_run    <= 1'b1;
-            rec_step   <= 5'd0;
+            rec_step   <= 8'd0;
             rc_a <= m7a_out;    rc_b <= m7b_out;
             rc_c <= m7c_out;    rc_d <= m7d_out;
             rc_x <= m7x_out;    rc_y <= m7y_out;
             rc_h <= m7hofs_out; rc_v <= m7vofs_out;
         end else if (cur_mask != 8'd0)
             rec_drops <= rec_drops + 8'd1;
+    // dstat (the dump's 0xFB completion record) outranks chunks: with
+    // chunks queued the 0xFB used to trail them by seconds of UART, and
+    // the daemon's dump-sequencing logic reads that lag as loss.
+    // dstat/wt pushes MUST respect rec_room like the line branch: these land
+    // unannounced on top of a FIFO already carrying line+sync traffic, and an
+    // unguarded push past 512 aliases the 10-bit pointers and garbles the
+    // stream (lost 0xFB = dumps never complete while Mode 7 is busy). pend
+    // flags hold until the serializer drains room — pacing, not loss.
+    end else if (dstat_pend && rec_room) begin
+        rec_len    <= 8'd5;
+        rec_line_b <= M7_RECVRAM_DONE;
+        rec_mask_b <= dump_seq;         // [2] dump sequence number
+        rec_ah_b   <= wt_drops[7:0];    // [3] wt drop baseline low byte
+        rec_mode   <= RM_DSTAT;
+        rec_rm     <= 9'd0;
+        rec_run    <= 1'b1;
+        rec_step   <= 8'd0;
+    // Chunks yield the channel to live records: the cap keeps at most one
+    // staged chunk (~244 B) in the FIFO, so a dump consumes only the slack
+    // the line stream doesn't need (~30 kB/s at full line coverage — a dump
+    // stretches to ~2 s) instead of queuing 268 B and starving the push
+    // sequencer through active video (that missed hblank capture edges:
+    // on device, cov fell to 0/224 lines per frame while a dump ran and
+    // 152/224 in mixed frames — the band corruption). The chunk waits for
+    // room rather than pushing into a nearly-full FIFO: 244 B is larger
+    // than anything else on the stream, and dump_byte_win is blocked while
+    // dump_pend, so backpressure holds.
+    end else if (dump_pend && (rec_count < 11'd40)) begin
+        rec_len    <= dp_len;
+        rec_line_b <= dp_op;
+        rec_mask_b <= dp_b2;
+        rec_ah_b   <= dp_b3;
+        rec_mode   <= RM_DCHUNK;
+        rec_rm     <= 9'd0;
+        rec_run    <= 1'b1;
+        rec_step   <= 8'd0;
+    end else if (wt_pend && rec_room) begin
+        rec_len    <= 8'd4 + {4'd0, wt_n};
+        rec_line_b <= M7_RECVRAM_WT;
+        rec_mask_b <= wt_al;
+        rec_ah_b   <= wt_ah;
+        rec_wt_base <= wt_base;
+        rec_wt_n    <= wt_n;
+        rec_mode   <= RM_WT;
+        rec_rm     <= 9'd0;
+        rec_run    <= 1'b1;
+        rec_step   <= 8'd0;
     end
 end
 
+// Chunk staging buffer: write port fed by the dump reader, read port by the
+// push sequencer (dbuf_ra above). Registered read = one-cycle latency, part
+// of the dbuf_ra = rec_step-3 alignment.
+always @(posedge clk_sys) begin
+    if (dbuf_we)
+        chunk_buf[dbuf_wa] <= dbuf_wd;
+    chunk_buf_q <= chunk_buf[dbuf_ra];
+end
+
+// ===========================================================================
+// Dump + write-through emitter (clk_sys). Owns every dump_*/dbuf_w*/wt_*
+// staging register; reacts to the push block's rec_run/rec_mode/rec_step/
+// rec_done for its handshakes.
+// ===========================================================================
+always @(posedge clk_sys) begin
+    // Request consumption: dump_fire arrives from the guarded ctrl adoption
+    // (one pulse per genuinely-new word). The arm latch keeps its level
+    // semantics — a request only fires after a clear word was adopted, so a
+    // completed dump can't re-trigger while the daemon drains its 0xFB;
+    // arming and the fire acknowledgement live in the adoption block, which
+    // solely drives dump_fire/dump_req_arm.
+    if (dump_fire && dump_req_arm && !dump_active && !dump_pend && !dstat_pend) begin
+        dump_active  <= 1'b1;
+        dump_plane   <= 1'b0;
+        dump_rd      <= 16'd0;
+        dump_bc      <= 9'd0;
+        dump_stall   <= 22'd0;
+    end
+
+    // push-block handshakes: staged -> running (the step==0 cycle identifies
+    // the record the sequencer just started)
+    if (dump_pend && rec_run && rec_mode == RM_DCHUNK && rec_step == 8'd0)
+        dump_pend <= 1'b0;
+    if (dstat_pend && rec_run && rec_mode == RM_DSTAT && rec_step == 8'd0)
+        dstat_pend <= 1'b0;
+
+    // VRAM byte landing: q_b holds the byte for the address presented one
+    // cycle ago, so presented_d marks the write window
+    dump_presented_d <= dump_byte_win;
+    if (dump_byte_win) begin
+        bw_cnt <= bw_cnt + 16'd1;
+        dump_rd <= dump_rd + 16'd1;
+        chunk_active <= 1'b1;
+    end
+    if (dump_presented_d) begin
+        dbuf_we <= 1'b1;
+        dbuf_wa <= dump_bc[7:0];
+        dbuf_wd <= dump_qb;
+        dump_bc <= dump_bc + 9'd1;
+    end else begin
+        dbuf_we <= 1'b0;
+    end
+
+    // stage a completed chunk (waits out the two-cycle write pipeline)
+    if (stage_chunk) begin
+        dump_pend    <= 1'b1;
+        chunk_active <= 1'b0;
+        dp_len     <= 8'd4 + dump_bc[7:0];
+        dp_op      <= M7_RECVRAM_DUMP;
+        dp_b2      <= chunk_base[7:0];
+        dp_b3      <= {dump_plane, chunk_base[14:8]};
+        dump_last  <= dump_plane && dump_rd_end;
+        dump_bc    <= 9'd0;
+        if (dump_rd_end && !dump_plane) begin
+            dump_plane <= 1'b1;      // plane 1 done: switch, restart address
+            dump_rd    <= 16'd0;
+        end
+    end
+
+    // Kill-time wedge recovery: a dump whose 0xFB push was dropped by a full
+    // FIFO (daemon killed mid-dump) used to leave dump_active set forever —
+    // rd parked at the plane end, byte window closed, every later request
+    // swallowed by !dump_active, until a core reload. Watch for progress:
+    // with the yield cap a healthy dump stages a chunk at least every few
+    // ms; ~195 ms (2^22 clk_sys) with nothing staged and nothing pending
+    // (pend = backpressure, which is healthy) means the FSM is wedged.
+    // Abandon it — the request path then accepts the daemon's next request
+    // and the image self-heals from wt records + the fresh dump.
+    if (dump_active) begin
+        if (stage_chunk || dump_pend || dstat_pend)
+            dump_stall <= 22'd0;
+        else if (&dump_stall) begin
+            dump_active <= 1'b0;
+            dump_pend   <= 1'b0;
+            dump_stall  <= 22'd0;
+        end else begin
+            dump_stall <= dump_stall + 22'd1;
+        end
+    end
+
+    // dump completion chain: plane 2's tail chunk pushed -> status record;
+    // status pushed -> dump finished
+    if (rec_done && rec_mode == RM_DCHUNK && dump_last) begin
+        dump_last   <= 1'b0;
+        dstat_pend  <= 1'b1;
+    end
+    if (rec_done && rec_mode == RM_DSTAT) begin
+        dump_active <= 1'b0;
+        dump_seq    <= dump_seq + 8'd1;
+    end
+
+    // write-through run staging + retire
+    if (wt_pend && rec_run && rec_mode == RM_WT && rec_step == 8'd0)
+        wt_pend <= 1'b0;
+    if (wt_stage) begin
+        wt_pend <= 1'b1;
+        wt_n    <= wt_run;
+        wt_base <= wt_r;
+        wt_al   <= wt_e0[15:8];
+        wt_ah   <= {wt_e0[23], wt_e0[22:16]};
+    end
+    if (rec_done && rec_mode == RM_WT)
+        wt_r <= wt_r + rec_wt_n;
+end
+
 // --- VRAM write-through FIFO ---------------------------------------------
-// Snoops the CPU write ports (port A of vram1/vram2). In v1 each entry was
-// one 16-bit DDR3 write; in v2 the entries have no consumer yet (P2c packs
-// them into UART delta messages) but the snoop already runs in its final
-// shape so the versions/drop accounting is live.
-reg [23:0] wt_fifo [0:7];
-reg [3:0]  wt_w = 4'd0, wt_r = 4'd0;
-wire [3:0] wt_cnt = wt_w - wt_r;
+// Snoops the CPU write ports (port A of vram1/vram2) into the wt_fifo
+// declared with the coalescing scan above; the dump/wt emitter block packs
+// same-plane consecutive runs into 0xFC UART records and retires them.
+// wt_w/version accounting lives here so a same-cycle snoop and retire
+// never collide (different registers).
 
 // ===========================================================================
 // One clk_sys always block owns the frame controller and the write-through
@@ -1924,7 +2241,7 @@ always @(posedge clk_sys) begin
     // lands many cycles later, so ctrl_new can never coincide with
     // m7_frame_evt. Telemetry showed polls completing every frame with the
     // exact published word while daemon_present stayed 0 — the branch was
-    // unreachable by construction.) Bits [31:18] are reserved-zero in the
+    // unreachable by construction.) Bits [31:19] are reserved-zero in the
     // ABI and bit 17 (FMT8) must be set — requiring them rejects random
     // boot-time DDR3 garbage in the no-daemon-yet window (a false adoption
     // would set daemon_present and fetch garbage with nobody publishing)
@@ -1937,31 +2254,61 @@ always @(posedge clk_sys) begin
     // CGRAM fades track within a frame.
     if (fetch_restart)
         fetch_restart <= 1'b0;
-    if (ctrl_new && (m7_ctrl_data[31:18] == 14'd0) &&
+    // ---- DUMP_REQ one-shot fire + arm latch. This block solely drives
+    // dump_fire/dump_req_arm; the dump FSM only reads them. The fire is a
+    // ONE-SHOT per adopted word: the old dump-FSM block reacted to bare
+    // ctrl_new — which pulses once per POLL, every frame, changed word or
+    // not — with no seq guard, so any stale or garbage capture with bit 18
+    // set fired a dump (on device: dumps every ~2 s with no matching
+    // daemon request, each one starving the line stream).
+    // Acknowledgement precedes the adoption branch so a fresh request
+    // pulse in the same cycle wins. Nonblocking semantics keep the
+    // handshake with the dump FSM race-free (it activates on the identical
+    // condition in the same cycle).
+    if (dump_fire && dump_req_arm && !dump_active && !dump_pend && !dstat_pend) begin
+        dump_fire    <= 1'b0;
+        dump_req_arm <= 1'b0;
+    end else if (dump_fire && !dump_req_arm) begin
+        dump_fire <= 1'b0;   // not armed: swallowed, drop the pulse
+    end
+    // [31:19] reserved (M7_CTRL_DUMP_REQ = bit 18 is a legitimate request,
+    // not garbage — P2c-3; the v2.1 mask [31:18] would have rejected every
+    // dump-requesting word and silently frozen frame adoption).
+    if (ctrl_new && (m7_ctrl_data[31:19] == 13'd0) &&
         m7_ctrl_data[M7_CTRL_FMT8] &&
         (m7_ctrl_data[15:0] != last_ready_seq)) begin
         daemon_present <= 1'b1;
         cur_buf        <= m7_ctrl_data[M7_CTRL_READY_BUF];
         last_ready_seq <= m7_ctrl_data[15:0];
         fetch_restart  <= 1'b1;
+        dump_fire      <= m7_ctrl_data[M7_CTRL_DUMP_REQ];
+        if (!m7_ctrl_data[M7_CTRL_DUMP_REQ]) dump_req_arm <= 1'b1;
     end
     if (ctrl_new) cdn_cnt <= cdn_cnt + 16'd1;
 
     // ---- VRAM write-through snoop (last: same-cycle writes never lost) ----
-    if (~VRAM1_WE_N) begin
+    // Edge-detected: the PPU holds WE low for several clk_sys cycles per
+    // write, so a level sample pushes 4-6 duplicate entries per write and
+    // floods the 8-deep FIFO. One push per falling WE edge = one per write.
+    // wt_drops wraps (no saturation): the daemon's drift detection uses a
+    // wrap-safe 16-bit delta, and a pinned counter would hide every
+    // map-load burst after the first.
+    vram1_we_d <= VRAM1_WE_N;
+    vram2_we_d <= VRAM2_WE_N;
+    if (~VRAM1_WE_N && vram1_we_d) begin
         if (wt_cnt < 4'd8) begin
             wt_fifo[wt_w[2:0]] <= {1'b0, VRAM1_ADDR[14:0], VRAM1_D};
             wt_w      <= wt_w + 4'd1;
             vram1_ver <= vram1_ver + 16'd1;
-        end else if (wt_drops != 16'hFFFF)
+        end else
             wt_drops <= wt_drops + 16'd1;
     end
-    if (~VRAM2_WE_N) begin
+    if (~VRAM2_WE_N && vram2_we_d) begin
         if (wt_cnt < 4'd8) begin
             wt_fifo[wt_w[2:0]] <= {1'b1, VRAM2_ADDR[14:0], VRAM2_D};
             wt_w      <= wt_w + 4'd1;
             vram2_ver <= vram2_ver + 16'd1;
-        end else if (wt_drops != 16'hFFFF)
+        end else
             wt_drops <= wt_drops + 16'd1;
     end
 end
@@ -2466,10 +2813,21 @@ assign dbg_bytes[1031:1024] = disp_row;               // [128] displayed row
 assign dbg_bytes[1039:1032] = last_row_id;            // [129] inactive-slot row
 assign dbg_bytes[1047:1040] = {row_adv, act, 6'b0};   // [130] swap activity
 assign dbg_bytes[1055:1048] = rec_drops;              // [131] records dropped (room)
+assign dbg_bytes[1063:1056] = {dump_req_arm, dstat_pend, dump_pend, dump_last,
+                               dump_active, dump_plane, 2'b00}; // [132] dump phase
+assign dbg_bytes[1071:1064] = dump_seq;               // [133] completed dumps
+assign dbg_bytes[1087:1072] = vram1_ver;              // [134..135] plane-1 wt version
+assign dbg_bytes[1103:1088] = vram2_ver;              // [136..137] plane-2 wt version
+assign dbg_bytes[1119:1104] = wt_drops;               // [138..139] wt drops
+// P2c-3 dump diagnostics (bytes 140..147): where the dump FSM actually is.
+assign dbg_bytes[1135:1120] = dump_rd;                // [140..141] dump read ptr
+assign dbg_bytes[1151:1136] = {7'b0, dump_bc};        // [142..143] bytes landed
+assign dbg_bytes[1167:1152] = bw_cnt;                 // [144..145] byte-win pulses
+assign dbg_bytes[1183:1168] = {5'b0, rec_count};      // [146..147] record FIFO fill
 assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
 assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
 assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
-assign dbg_bytes[2047:1056] = {124{32'hAAAA_AAAA}};   // filler (bytes 132..255)
+assign dbg_bytes[2047:1184] = {108{32'hAAAA_AAAA}};   // filler (bytes 148..255)
 
 wire m7_stream_txd;
 m7_reg_stream #(
@@ -2484,6 +2842,7 @@ m7_reg_stream #(
 	.rec_wr    (rec_wr),
 	.rec_data  (rec_data),
 	.rec_room  (rec_room),
+	.rec_count (rec_count),
 	.txd       (m7_stream_txd)
 );
 assign m7_dbg_tx = m7_stream_txd;

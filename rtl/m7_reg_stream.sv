@@ -30,10 +30,12 @@
 // itself), pushed whole by the parent; a record may straddle two payloads
 // (the receiver carries the partial) and a CRC-failed payload invalidates
 // the stream until the next line-0xFE full sync at the next vblank.
-// Wire budget at 3 Mbaud: payload opportunities ~1100/s; every 16th is
-// telemetry, the rest carry records only when the FIFO is non-empty
-// (idle slots are skipped, keeping the link quiet). 15/16 * 256 B * 1100/s
-// ~ 264 KB/s of record bandwidth vs the 134 KB/s worst-case game demand.
+// Wire budget at 3 Mbaud: payload opportunities ~1100/s; every 64th is
+// telemetry (P2c-4: was 1-in-16 — the measured channel budget per line
+// period is ~18 B, and telemetry took 6.25 % of it; 1.56 % frees ~14 kB/s
+// for line records), the rest carry records only when the FIFO is non-empty
+// (idle slots are skipped, keeping the link quiet). 63/64 * 256 B * 1100/s
+// ~ 278 KB/s of record bandwidth.
 //
 // Frame (little-endian):
 //   A5 5C seq_l seq_h len_l len_h payload[0..len-1] crc8
@@ -58,6 +60,8 @@ module m7_reg_stream #(
 	input        rec_wr,       // record byte push (whole records, in order)
 	input  [7:0] rec_data,
 	output       rec_room,     // 1 = space for another record; drop when 0
+	output wire [10:0] rec_count, // FIFO fill level (parent sizes its records
+	                              // against this before staging them)
 	output reg   txd = 1'b1
 );
 
@@ -91,7 +95,13 @@ module m7_reg_stream #(
 	reg [7:0]  rec_mem [0:511];
 	reg [9:0]  rec_w = 10'd0, rec_r = 10'd0;
 	wire [10:0] rec_cnt = rec_w - rec_r;
-	assign rec_room = (rec_cnt < 11'd492);
+	assign rec_count = rec_cnt;
+	// Room gate for line records. Two records must ALWAYS fit after the
+	// gate closes: the worst in-flight/queued line record (20 B) and the
+	// unconditional vblank sync (20 B) — the sync branch has no room
+	// check, and fill reaching 512 aliases the 10-bit pointers (count
+	// wraps to 0). 471 + 20 + 20 = 511: exactly full, never aliased.
+	assign rec_room = (rec_cnt < 11'd472);
 	wire       rec_avail = (rec_r != rec_w);
 
 	always @(posedge clk) begin
@@ -111,7 +121,7 @@ module m7_reg_stream #(
 	reg  [7:0]  g_crc   = 8'd0;
 	reg  [15:0] g_idx   = 16'd0;
 	reg  [15:0] g_gap   = 16'd0;
-	reg  [3:0]  slot_cnt = 4'd0;  // payload opportunities, mod 16 (mode 3)
+	reg  [7:0]  slot_cnt = 8'd0;  // payload opportunities, mod 64 (mode 3)
 
 	wire [7:0] hdr_byte = (g_idx == 0) ? g_seq[7:0] :
 	                      (g_idx == 1) ? g_seq[15:8] :
@@ -145,17 +155,19 @@ module m7_reg_stream #(
 				// idle gap (~64 baud bits) between frames lets the checker
 				// resync. In mode 3 a non-telemetry slot with an empty
 				// record FIFO is skipped: the slot counter still advances
-				// so telemetry keeps its 1-in-16 cadence, but the link
-				// stays quiet while no records are pending.
+				// so telemetry keeps its 1-in-64 cadence (P2c-4: 16->64
+				// frees ~14 kB/s of the 3 Mbaud channel for line records —
+				// the daemon watchdog grace is matched to this cadence),
+				// but the link stays quiet while no records are pending.
 				G_GAP: if (test_mode != 2'd0 && &g_gap[5:0] && !fifo_full) begin
-					if (test_mode == 2'd3 && slot_cnt[3:0] != 4'h0 && !rec_avail) begin
+					if (test_mode == 2'd3 && slot_cnt != 8'h00 && !rec_avail) begin
 						g_gap    <= 16'd0;
-						slot_cnt <= slot_cnt + 4'd1;
+						slot_cnt <= slot_cnt + 8'd1;
 					end else begin
 						g_gap    <= 16'd0;
 						g_state  <= G_SYNC1;
-						slot_cnt <= slot_cnt + 4'd1;
-						is_tel   <= (test_mode != 2'd3) || (slot_cnt[3:0] == 4'h0);
+						slot_cnt <= slot_cnt + 8'd1;
+						is_tel   <= (test_mode != 2'd3) || (slot_cnt == 8'h00);
 					end
 				end else if (nco_tick)
 					g_gap <= g_gap + 16'd1;
