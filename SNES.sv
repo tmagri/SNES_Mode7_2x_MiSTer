@@ -1929,6 +1929,24 @@ reg  [3:0]  rec_wt_n;               // staged copy of wt_n: retire exactly the
 reg  [15:0] rc_a, rc_b, rc_c, rc_d; // last captured line's values (reference)
 reg  [12:0] rc_x, rc_y, rc_h, rc_v;
 reg  [7:0]  rec_drops = 8'd0;       // records dropped for FIFO room
+// Line retry stash (P2c-5): a line whose hblank edge hits while the push
+// sequencer is busy or the ring is full is STASHED here and pushed at the
+// first idle slot instead of being lost — measured on device, ~52/224
+// lines/frame were lost this way in Mode 7-heavy scenes (every gap line
+// renders with the previous line's regs: the HDMA perspective banding).
+// rec_drops counts only a stash OVERWRITTEN by a newer line (a real loss);
+// delivered retries are not drops.
+reg         line_pend = 1'b0;
+reg         p_abs = 1'b0;           // pending survived an overwrite (wt-burst
+                                    // stretch): deliver it as a full-mask
+                                    // ABSOLUTE record — one record repairs the
+                                    // whole stretch via the daemon's gap fill
+reg  [7:0]  p_line, p_mask;
+reg  [15:0] rc2_a, rc2_b, rc2_c, rc2_d;
+reg  [12:0] rc2_x, rc2_y, rc2_h, rc2_v;
+reg  [15:0] rec_drops16 = 16'd0;    // stash overwrites (a real loss; the old
+                                    // 8-bit counter wraps within one frame)
+reg  [15:0] rec_retries = 16'd0;    // retry pushes delivered
 
 wire        rec_room;
 
@@ -1978,11 +1996,13 @@ wire [7:0] rec_mode_data =
                               wt_fifo[(rec_wt_base[2:0] + rec_step[2:0] + 3'd4)][7:0];
 
 // Record push sequencer (sole driver of rec_wr). Pushes are 1 byte/cycle.
-// Priority: per-frame sync > per-line delta (render-critical) > dump chunk
-// > dump status > write-through run. If the FIFO runs out of room a line
-// record is dropped whole (the next frame's 0xFE full sync repairs the
-// daemon); VRAM records are never staged without room, so they always
-// complete once started.
+// Priority: per-frame sync > line retry > per-line delta (render-critical)
+// > dump chunk > dump status > write-through run. A line whose edge hits
+// while the sequencer is busy or the ring is full is STASHED (line_pend)
+// and pushed at the first idle slot; only a stash overwritten by a newer
+// line is a real drop (the next frame's 0xFE full sync repairs the daemon);
+// VRAM records are never staged without room, so they always complete once
+// started.
 // (vbl_d is driven here since the old shared block was deleted with the
 // ml_* capture; frame_start above samples it.)
 always @(posedge clk_sys) begin
@@ -2012,8 +2032,25 @@ always @(posedge clk_sys) begin
             rec_run  <= 1'b0;
             rec_done <= 1'b1;
         end
+        // Edge catch while a record is mid-push: the live capture branch is
+        // unreachable this cycle, so stash the line for the retry push.
+        if (~HBlank_out & rec_hd_d && !vblank_out && (ppu_y < 9'd224) &&
+                cur_mask != 8'd0) begin
+            p_line  <= ppu_y[7:0];
+            p_mask  <= cur_mask;
+            rc2_a <= m7a_out;    rc2_b <= m7b_out;
+            rc2_c <= m7c_out;    rc2_d <= m7d_out;
+            rc2_x <= m7x_out;    rc2_y <= m7y_out;
+            rc2_h <= m7hofs_out; rc2_v <= m7vofs_out;
+            rec_drops   <= line_pend ? (rec_drops + 8'd1) : rec_drops;
+            rec_drops16 <= line_pend ? (rec_drops16 + 16'd1) : rec_drops16;
+            p_abs       <= line_pend;   // overwrite => burst stretch => absolute
+            line_pend   <= 1'b1;
+        end
     end else if (sync_pend || frame_start) begin
         sync_pend  <= 1'b0;
+        line_pend  <= 1'b0;     // a pending line straddling vblank is stale
+        p_abs      <= 1'b0;
         rec_len    <= 8'd20;
         rec_line_b <= 8'hFE;
         rec_mask_b <= 8'hFF;
@@ -2026,6 +2063,32 @@ always @(posedge clk_sys) begin
         rc_c <= m7c_out;    rc_d <= m7d_out;
         rc_x <= m7x_out;    rc_y <= m7y_out;
         rc_h <= m7hofs_out; rc_v <= m7vofs_out;
+    end else if (line_pend && rec_room) begin
+        // Retry push (P2c-5): deliver a line whose edge hit while the
+        // sequencer was busy or the ring was full. Sits ABOVE the live
+        // branch so wire order stays ascending — an edge landing during
+        // this push is caught by the rec_run branch's stash instead.
+        // rc advances to the RETRIED values: the daemon's chain just
+        // applied this record's delta, so the next capture's mask must
+        // diff against them or every later delta in the frame misapplies.
+        // A pending that survived an overwrite (a wt-burst stretch ate the
+        // intermediate lines) delivers as a full-mask ABSOLUTE record: the
+        // daemon applies it as a plain delta of all 8 fields and its gap
+        // fill carries the values across the whole lost stretch.
+        line_pend  <= 1'b0;
+        p_abs      <= 1'b0;
+        rec_retries <= rec_retries + 16'd1;
+        rec_len    <= p_abs ? 8'd19 : (8'd3 + {popcnt8(p_mask), 1'b0});
+        rec_line_b <= p_line;
+        rec_mask_b <= p_abs ? 8'hFF : p_mask;
+        rec_mode   <= RM_LINE;
+        rec_rm     <= {1'b0, p_abs ? 8'hFF : p_mask};
+        rec_run    <= 1'b1;
+        rec_step   <= 8'd0;
+        rc_a <= rc2_a;    rc_b <= rc2_b;
+        rc_c <= rc2_c;    rc_d <= rc2_d;
+        rc_x <= rc2_x;    rc_y <= rc2_y;
+        rc_h <= rc2_h;    rc_v <= rc2_v;
     end else if (~HBlank_out & rec_hd_d && !vblank_out && (ppu_y < 9'd224)) begin
         if (cur_mask != 8'd0 && rec_room) begin
             rec_len    <= 8'd3 + {popcnt8(cur_mask), 1'b0};
@@ -2039,8 +2102,22 @@ always @(posedge clk_sys) begin
             rc_c <= m7c_out;    rc_d <= m7d_out;
             rc_x <= m7x_out;    rc_y <= m7y_out;
             rc_h <= m7hofs_out; rc_v <= m7vofs_out;
-        end else if (cur_mask != 8'd0)
-            rec_drops <= rec_drops + 8'd1;
+        end else if (cur_mask != 8'd0) begin
+            // Ring full at the edge: defer to the retry stash instead of
+            // dropping the line outright (a pending line lost to the
+            // overwrite still counts as a drop, and flips the pending to
+            // absolute — one full-mask record then repairs the stretch).
+            p_line  <= ppu_y[7:0];
+            p_mask  <= cur_mask;
+            rc2_a <= m7a_out;    rc2_b <= m7b_out;
+            rc2_c <= m7c_out;    rc2_d <= m7d_out;
+            rc2_x <= m7x_out;    rc2_y <= m7y_out;
+            rc2_h <= m7hofs_out; rc2_v <= m7vofs_out;
+            rec_drops   <= line_pend ? (rec_drops + 8'd1) : rec_drops;
+            rec_drops16 <= line_pend ? (rec_drops16 + 16'd1) : rec_drops16;
+            p_abs       <= line_pend;
+            line_pend   <= 1'b1;
+        end
     // dstat (the dump's 0xFB completion record) outranks chunks: with
     // chunks queued the 0xFB used to trail them by seconds of UART, and
     // the daemon's dump-sequencing logic reads that lag as loss.
@@ -2824,10 +2901,16 @@ assign dbg_bytes[1135:1120] = dump_rd;                // [140..141] dump read pt
 assign dbg_bytes[1151:1136] = {7'b0, dump_bc};        // [142..143] bytes landed
 assign dbg_bytes[1167:1152] = bw_cnt;                 // [144..145] byte-win pulses
 assign dbg_bytes[1183:1168] = {5'b0, rec_count};      // [146..147] record FIFO fill
+// P2c-5 line-retry diagnostics (bytes 148..151): the 8-bit [131] counter
+// wraps within one frame under wt bursts — these are the wide truth.
+assign dbg_bytes[1191:1184] = rec_drops16[7:0];       // [148] stash overwrites (l)
+assign dbg_bytes[1199:1192] = rec_drops16[15:8];      // [149] stash overwrites (h)
+assign dbg_bytes[1207:1200] = rec_retries[7:0];       // [150] retry pushes (l)
+assign dbg_bytes[1215:1208] = rec_retries[15:8];      // [151] retry pushes (h)
 assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
 assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
 assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
-assign dbg_bytes[2047:1184] = {108{32'hAAAA_AAAA}};   // filler (bytes 148..255)
+assign dbg_bytes[2047:1216] = {104{32'hAAAA_AAAA}};   // filler (bytes 152..255)
 
 wire m7_stream_txd;
 m7_reg_stream #(

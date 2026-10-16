@@ -83,6 +83,11 @@ reg [1:0]  ch = 2'd0;   // 2 bits: 0=rom 1=MSU 2=HD fetch (was 1 bit — a 2'd2
                         // client ID silently truncated to 0 and every HD
                         // completion misrouted into the rom branch, so the
                         // fetch FSM never saw a single ack)
+reg        hd_turn = 1'b0;  // HD interleave: when both rom and HD are pending,
+                            // hand this slot to HD every other time. Lowest
+                            // priority starved HD to 8 rows/frame behind SMK's
+                            // cart traffic; strict alternation gives HD ~50%
+                            // of contended slots while both stay pending.
 
 reg [1:0]  cache_valid;
 
@@ -111,7 +116,14 @@ always @(posedge DDRAM_CLK) begin
 		ram_read  <= 0;
 
 		case(state)
-			0: if(rom_req != rom_ack) begin
+			// HD interleave: when both rom and HD are pending and hd_turn is
+			// set, skip the rom/MSU chain this slot and serve HD below. The
+			// old lowest-priority placement let the HD sweep starve behind
+			// cart traffic (8 rows/frame, lap = 28 frames — the row-age
+			// gradient across the lap IS the visible banding). Rom absorbs
+			// the extra one-word latency via the core's clock-stretch, the
+			// same mechanism that absorbs all its DDR3 latency.
+			0: if((rom_req != rom_ack) && !((hd_req != hd_ack) && hd_turn)) begin
 					if(rom_we) begin
 						ram_be      <= rom_be;
 						ram_data	<= rom_din;
@@ -168,12 +180,15 @@ always @(posedge DDRAM_CLK) begin
 				end
 				// HD Mode 7 fetch: burst-1 word read (see port comment). No
 				// read cache — rows are streamed once and not re-visited.
+				// hd_turn toggles only here: while both clients stay pending
+				// this branch and the rom branch above alternate slots.
 				else if(hd_req != hd_ack) begin
 					ram_address <= hd_addr;
 					ram_read    <= 1;
 					ram_burst   <= 1;
 					ch          <= 2'd2;
 					state       <= 2;
+					hd_turn     <= ~hd_turn;
 				end
 
 			1: begin

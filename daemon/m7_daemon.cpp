@@ -15,6 +15,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <termios.h>
@@ -262,9 +263,22 @@ class M7Daemon {
                   << " rd=" << tel_rd_ << " bc=" << tel_bc_
                   << " bw=" << tel_bw_ << " rcnt=" << tel_rcnt_
                   << " cov=" << cov_lines_last_ << "/224 g=" << cov_gap_last_
+                  << " drops16=" << tel_drops16_ << " retry=" << tel_retry_
+                  << " arm=" << tel_arm_ << "/224 lri="
+                  << static_cast<int>(tel_lri_) << " dr="
+                  << static_cast<int>(tel_disp_row_)
+                  << " py=" << tel_ppuy_
+                  << " ars=" << tel_ars_ << " pub=" << ready_seq_
+                  << " rows=" << std::hex << RowsHex(tel_rows_, 0, 14)
+                  << RowsHex(tel_rows_, 14, 28) << std::dec
+                  << " hde=" << tel_hde_
+                  << " fr=" << (drt_frames_ ? (drt_acc_ / 32) / drt_frames_
+                                            : 0) << "r/f"
                   << " wt=" << wt_recs_last_ << "r/" << wt_bytes_last_ << "B"
                   << (dump_requested_ ? " dumpWAIT" : "")
                   << (dump_req_pending_ ? " dumpREQ" : "") << std::endl;
+        drt_acc_    = 0;
+        drt_frames_ = 0;
         log_mark = frames_valid_;
       }
       sleep_ns(2000000ull);  // 2 ms poll; syncs arrive at 60 Hz
@@ -348,6 +362,33 @@ class M7Daemon {
       // bytes are lost for good.
       if (fr.payload[0] == 0xC3 && carry_len_ == 0) {
         if (fr.len >= 132) tel_drops_ = fr.payload[131];
+        // Display-path counters (pre-P2c bytes, still live): arm_cnt = lines
+        // that actually showed the HD buffer last frame (224 = no native
+        // fallback), disp_row = the row id in the displayed linebuf slot.
+        if (fr.len >= 44)  tel_arm_ = le16(fr.payload + 42);
+        if (fr.len >= 129) tel_disp_row_ = fr.payload[128];
+        // Full sticky row_done bitmap (payload 4..31 = rows 0..223): shows
+        // the fetch sweep's lead/consumed prefix directly. last_row_id [129]
+        // is the row sitting complete in the inactive linebuf slot.
+        if (fr.len >= 130) {
+          memcpy(tel_rows_, fr.payload + 4, sizeof(tel_rows_));
+          tel_lri_ = fr.payload[129];
+        }
+        // Sweep throughput: drt_cnt [36] (completed fetch words, 32/row) is
+        // cumulative but only accrues ~11-14k words between telemetry
+        // samples (~64 frames), so the 16-bit delta never wraps. Divide by
+        // 32 and by the exact number of SNES frames since the previous
+        // telemetry frame (counted via 0xFE syncs) -> rows/frame.
+        if (fr.len >= 44) {
+          const uint16_t drt_now = le16(fr.payload + 36);
+          drt_acc_ += static_cast<uint16_t>(drt_now - drt_prev_);
+          drt_prev_ = drt_now;
+          tel_hde_ = le16(fr.payload + 40);
+          drt_frames_ += syncs_ - drt_sync_mark_;
+          drt_sync_mark_ = syncs_;
+          tel_ppuy_ = le16(fr.payload + 58);  // scanline at sample instant
+          tel_ars_  = le16(fr.payload + 60);  // FPGA's last adopted ready_seq
+        }
         // FPGA dump-machinery window (bytes 140-147, P2c-3 diag block):
         // dm = fetch/dump FSM state, rd = dump read pointer, bc = bytes
         // landed in the in-flight chunk, bw = byte-window cycles ever,
@@ -360,6 +401,13 @@ class M7Daemon {
           tel_bc_   = le16(fr.payload + 142);
           tel_bw_   = le16(fr.payload + 144);
           tel_rcnt_ = le16(fr.payload + 146);
+        }
+        // P2c-5 line-retry counters (bytes 148-151): stash overwrites (real
+        // losses, 16-bit — the legacy [131] byte wraps within one frame
+        // under wt bursts) and retry pushes delivered.
+        if (fr.len >= 152) {
+          tel_drops16_ = le16(fr.payload + 148);
+          tel_retry_   = le16(fr.payload + 150);
         }
         // Capability probe: pre-P2c-3 bitstreams fill telemetry bytes
         // 132+ with 0xAA. One telemetry frame decides whether VRAM dump
@@ -802,6 +850,30 @@ class M7Daemon {
   uint16_t tel_bc_        = 0;
   uint16_t tel_bw_        = 0;
   uint16_t tel_rcnt_      = 0;
+  uint16_t tel_drops16_   = 0;
+  uint16_t tel_retry_     = 0;
+  uint16_t tel_arm_       = 0;
+  uint8_t  tel_disp_row_  = 0;
+  uint8_t  tel_lri_       = 0;
+  uint8_t  tel_rows_[28]  = {};  // sticky row_done[223:0], rows 0..223
+  uint32_t drt_acc_       = 0;   // fetch words across the telemetry window
+  uint16_t drt_prev_      = 0;   // last cumulative drt_cnt sample
+  uint32_t drt_frames_    = 0;   // SNES frames in the telemetry window
+  uint32_t drt_sync_mark_ = 0;   // syncs_ at last telemetry frame
+  uint16_t tel_hde_       = 0;   // hde falls last frame (edge-detector check)
+  uint16_t tel_ppuy_      = 0;   // ppu_y at the telemetry sample instant
+  uint16_t tel_ars_       = 0;   // FPGA last_ready_seq at the sample instant
+
+  // Compact hex of a byte range for the status line (no separators).
+  static std::string RowsHex(const uint8_t *b, int from, int to) {
+    std::ostringstream os;
+    for (int i = from; i < to; ++i) {
+      os.width(2);
+      os.fill('0');
+      os << std::hex << static_cast<int>(b[i]);
+    }
+    return os.str();
+  }
   uint16_t tel_vram1_ver_ = 0;
   uint16_t tel_vram2_ver_ = 0;
   uint16_t tel_wt_drops_  = 0;
