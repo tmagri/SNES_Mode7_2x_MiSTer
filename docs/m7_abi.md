@@ -342,7 +342,12 @@ payload).
 | 142–143 | dump byte counter `dump_bc` (l,h) |
 | 144–145 | record byte-rate `bw_cnt` (l,h) |
 | 146–147 | record FIFO fill `rec_count` (l,h) |
-| 148–255 | `0xAA` fill *(bytes 140–147 were `0xAA` in P2c-3; the v6 diag block reuses them)* |
+| 148–151 | line-retry diagnostics (P2c-5): stash overwrites (l,h), retry pushes (l,h) |
+| 152 | `$2105` BGMODE low bits at the sample instant (P2c-8) |
+| 153–154 | `DM_WAIT` cycles this frame, >>4 (P2d-2 latency attribution; dbg bits 1239:1224 → payload bytes 153=lo, 154=hi) |
+| 155–156 | `DDRAM_BUSY` high cycles this frame, >>4 (P2d-2; dbg bits 1255:1240 → bytes 155=lo, 156=hi) |
+| 157 | slot flips this frame [3:0] (P2d-4; dbg bits 1263:1256; 0xAA on pre-P2d-4 rbf — filler cannot version-discriminate, daemon+rbf deploy as a pair) |
+| 158–255 | `0xAA` fill *(bytes 140–147 were `0xAA` in P2c-3; the v6 diag block reuses them)* |
 
 ## Receiver contract (daemon, P2c-3)
 

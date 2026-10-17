@@ -222,14 +222,50 @@ class M7Daemon {
         // buffers forever, so any HD line on screen is unambiguously the
         // card (a one-frame scene freeze is indistinguishable from the
         // live game in stills — the earlier static runs proved nothing).
-        if (completed_frame_ready_ && vram_valid_ && tel_mode_ == 7 &&
+        // P2d-3: the publish gate no longer trusts tel_mode_ alone. The
+        // FPGA's own arm counter (tel_arm_ = lines that showed HD last
+        // frame) is the authoritative, per-frame BGMODE truth from the
+        // entity that actually displays the result. SMK's attract flaps
+        // BGMODE 7<->1 at 60 Hz; tel_mode_ (two-frame-agree decode of
+        // payload[152]) tracks those flaps, which blocked ~95% of renders
+        // during the race demo (rend=4/295 syncs, gate= m:249) and left
+        // the pixbuf frozen at the flyby-era render — the fixed seam +
+        // stale full-map bottom half in the race shots. arm>0 catches
+        // what the mode flag misses; mode==7 keeps sub-frame entry speed.
+        if (completed_frame_ready_ && vram_valid_ &&
+            (tel_mode_ == 7 || tel_arm_ > 0) &&
             !static_card_ && !native_only_) {
+          // (render path unchanged; the else below counts WHY syncs
+          // failed to render — rend=4/295 syncs in the P2d-3 race
+          // window needs a culprit named per gate)
+          // P2d-3: render/publish instrumentation — how long a full
+          // 224-row render takes and how many renders per log window
+          // actually happen (vs the 60 syncs/s the FPGA ships; the
+          // gap between those two numbers is UART record loss).
+          const uint64_t rend_t0 = now_ns();
           cur_pub_ ^= 1u;
           RenderFrame(cur_pub_);
+          const uint64_t rend_ns = now_ns() - rend_t0;
+          ++rend_cnt_;
+          rend_tot_ns_ += rend_ns;
+          if (rend_ns > rend_max_ns_) rend_max_ns_ = rend_ns;
           PublishCtrl(CtrlWord(++ready_seq_, cur_pub_, false));
           last_render_ns_ = now_ns();
           published_frame = true;
           completed_frame_ready_ = false;
+        } else {
+          // P2d-3: name the blocking gate per sync — the race-window
+          // render collapse is otherwise unattributable from telemetry.
+          if (tel_mode_ != 7)
+            ++gf_mode_;
+          else if (!completed_frame_ready_)
+            ++gf_ready_;
+          else if (!vram_valid_)
+            ++gf_vram_;
+          else if (static_card_)
+            ++gf_card_;
+          else
+            ++gf_native_;
         }
       }
 
@@ -244,6 +280,19 @@ class M7Daemon {
       // the renderer is actually publishing (the yield cap keeps line
       // coverage alive during dumps, and dstat outranks chunks so
       // completions still land promptly).
+      //
+      // P2d-3 dump-gate postmortem: gating resync dumps out of Mode 7
+      // was a misdiagnosis and is REVERTED. syncrate stays 60/s under
+      // dumps (measured all along); the race render collapse was the
+      // BGMODE flap blocking the RENDER gate, fixed separately. What a
+      // mode-7 dump actually costs is sweep lag (arm 56-87/224 -> rows
+      // 1-2 frames stale). What dumps BUY is the only working VRAM
+      // updater: SMK's per-track VRAM reload during mode 7 is ~100%
+      // dropped by the wt channel (wtdrop 47-64k/window), so with dumps
+      // gated off the new track's tilemap never arrives and the whole
+      // race renders vertical-stripe garbage (p2d3c_cap_5). Dumps stay
+      // paced exactly as the pre-P2d-3 design: interval + cooldown +
+      // render-liveness.
       if (!native_only_ && !dump_requested_ && !dump_req_pending_ &&
           vram_valid_ && now - last_render_ns_ < 2000000000ull &&
           now - last_resync_ns_ >= ResyncInterval()) {
@@ -298,13 +347,42 @@ class M7Daemon {
                   << " hde=" << tel_hde_
                   << " fr=" << (drt_frames_ ? (drt_acc_ / 32) / drt_frames_
                                             : 0) << "r/f"
+                  << " lat/busy=" << tel_wait4_ << "/" << tel_busy4_
+                  << " cpw=" << (drt_acc_ ? (static_cast<uint64_t>(tel_wait4_)
+                                             * 16 * drt_frames_ / drt_acc_)
+                                          : 0)
+                  << " busy%="
+                  << (static_cast<uint64_t>(tel_busy4_) * 16 * 100 / 357404)
                   << " wt=" << wt_recs_last_ << "r/" << wt_bytes_last_ << "B"
                   << " wts=" << wtdrop_acc_
+                  << " rend=" << rend_cnt_
+                  << " ravg=" << (rend_cnt_ ? rend_tot_ns_ / rend_cnt_ / 1000
+                                            : 0) << "us"
+                  << " rmax=" << rend_max_ns_ / 1000 << "us"
+                  << " syncrate=" << (syncs_ - sync_mark_) / 5 << "/s"
+                  << " armstat=" << (arm_n_ ? (arm_sum_ / arm_n_) : 0) << "/"
+                  << arm_lo_ << "-" << arm_hi_ << "n" << arm_n_
+                  << " fl=" << flip_cnt_ * 2 << "/s"
+                  << " flip=" << (unsigned)flips_max_ << "/f"
+                  << " telr=" << RowsHex(tel_126_, 0, 8)
+                  << " mraw=0x" << std::hex << static_cast<int>(tel_150_[2])
+                  << std::dec
+                  << " gate= m:" << gf_mode_ << " rdy:" << gf_ready_
+                  << " vram:" << gf_vram_ << " card:" << gf_card_
+                  << " nat:" << gf_native_
                   << (dump_requested_ ? " dumpWAIT" : "")
                   << (dump_req_pending_ ? " dumpREQ" : "") << std::endl;
         drt_acc_    = 0;
         drt_frames_ = 0;
         wtdrop_acc_ = 0;
+        rend_cnt_   = 0;
+        rend_tot_ns_ = 0;
+        rend_max_ns_ = 0;
+        gf_mode_ = 0; gf_ready_ = 0; gf_vram_ = 0; gf_card_ = 0;
+        gf_native_ = 0;
+        arm_sum_ = 0; arm_n_ = 0; arm_lo_ = 65535; arm_hi_ = 0;
+        flip_cnt_ = 0; disp_prev_valid_ = 0; flips_max_ = 0;
+        sync_mark_  = syncs_;
         log_mark = frames_valid_;
       }
       sleep_ns(2000000ull);  // 2 ms poll; syncs arrive at 60 Hz
@@ -397,7 +475,36 @@ class M7Daemon {
         // that actually showed the HD buffer last frame (224 = no native
         // fallback), disp_row = the row id in the displayed linebuf slot.
         if (fr.len >= 44)  tel_arm_ = le16(fr.payload + 42);
-        if (fr.len >= 129) tel_disp_row_ = fr.payload[128];
+        // P2d-3 arm histogram (nonzero samples only): tel_arm_ is ONE
+        // frame's arm_cnt at the debug-frame instant; a per-window single
+        // sample read as "arm=87" can be a mid-frame BGMODE-flap clip
+        // (arm_cnt stops incrementing once bgmode_out leaves 7) rather
+        // than a stale front_done. lo/hi across the window discriminates:
+        // frozen front_done -> tight band around 87; flap clips -> 224s
+        // interleaved with small values.
+        if (tel_arm_) {
+          arm_sum_ += tel_arm_;
+          ++arm_n_;
+          if (tel_arm_ < arm_lo_) arm_lo_ = tel_arm_;
+          if (tel_arm_ > arm_hi_) arm_hi_ = tel_arm_;
+        }
+        if (fr.len >= 129) {
+          tel_disp_row_ = fr.payload[128];
+          // P2d-3 flip-rate estimate: disp_row = {7'd0, ~act} toggles at
+          // every slot flip. Stream frames sample it at 265-1200/s, so
+          // transitions per 5 s window / 5 = flips/s: 60 = one flip per
+          // vblank (correct); multiples of 60 = extra flips per frame =
+          // vblank_out glitches re-arming m7_swapped mid-vblank (the
+          // partial front_done / partial arm mechanism).
+          if (tel_disp_row_ != disp_prev_ && disp_prev_valid_) ++flip_cnt_;
+          disp_prev_ = tel_disp_row_;
+          disp_prev_valid_ = 1;
+        }
+        // P2d-3 dr forensics: dr=16 observed with disp_row only able to
+        // hold {0xFF,0,1} — capture the raw bytes 126..133 of the SAME
+        // frame the extended decode below samples, to see what the wire
+        // actually carries around byte 128 (disp_row/lri/swap-activity).
+        if (fr.len >= 134) memcpy(tel_126_, fr.payload + 126, 8);
         // Full sticky row_done bitmap (payload 4..31 = rows 0..223): shows
         // the fetch sweep's lead/consumed prefix directly. last_row_id [129]
         // is the row sitting complete in the inactive linebuf slot.
@@ -441,6 +548,26 @@ class M7Daemon {
             // misaligned or bleeding export is visible in the debug dump.
             last_tel_len_ = fr.len;
             memcpy(tel_150_, fr.payload + 150, 6);
+            // P2d-2 latency attribution. RTL packs wait4 at dbg bits
+            // [1239:1224] = payload bytes 153(lo=wait[11:4])/154(hi=wait[19:12])
+            // and busy4 at bits [1255:1240] = bytes 155(lo)/156(hi); byte 157
+            // starts the 0xAA filler on BOTH old and new builds, so it cannot
+            // discriminate bitstream versions — this daemon pairs with the
+            // P2d-2 rbf only (deploy together, md5-verified). Frame-scoped
+            // cycle counts >>4: DM_WAIT cycles (the port round trip plus any
+            // waiting behind rom/MSU slots) and DDRAM_BUSY-high cycles (ARM
+            // traffic holding the controller). Cycles per fetch word =
+            // wait<<4 / words; busy share of the frame = busy<<4 / frame
+            // cycles (~357.4k at 21.48 MHz / 60.1).
+            if (fr.len >= 158) {
+              tel_wait4_ = le16(fr.payload + 153);
+              tel_busy4_ = le16(fr.payload + 155);
+              // P2d-4: exact per-frame flip count (byte 157, P2d-4 rbf).
+              // The disp_row-transition estimator (fl=) samples disp_row at
+              // stream rate and can miss flips; this is the real count.
+              tel_flips_ = fr.payload[157];
+              if (tel_flips_ > flips_max_) flips_max_ = tel_flips_;
+            }
           }
         }
         // FPGA dump-machinery window (bytes 140-147, P2c-3 diag block):
@@ -568,7 +695,21 @@ class M7Daemon {
             if (tel_wt_drops_ != wtdrop_prev_) {
               const uint16_t d =
                   static_cast<uint16_t>(tel_wt_drops_ - wtdrop_prev_);
-              if (d < 20000u) wtdrop_acc_ += d;
+              if (d < 20000u) {
+                wtdrop_acc_ += d;
+                // P2d-4: surge trigger — wt drops are VRAM writes the FPGA's
+                // write-through channel could not serve; a burst of them is
+                // the game reloading a track's tilemap mid-Mode-7, which the
+                // wt channel drops ~100% (wtdrop 3k-64k/window measured).
+                // Without this the daemon renders stripes until the paced
+                // interval dump lands (~5 s later). 1000 drops ≈ 0.4-1 s of
+                // heavy streaming, well under the periodic interval.
+                wtdrop_since_dump_ += d;
+                if (wtdrop_since_dump_ >= 1000) {
+                  last_resync_ns_   = 0;   // force the resync branch below
+                  wtdrop_since_dump_ = 0;
+                }
+              }
               wtdrop_prev_ = tel_wt_drops_;
             }
           }
@@ -721,6 +862,17 @@ class M7Daemon {
       if (len < 20) return;
       if (shadow_synced_ && !pending_invalidate_) {
         FillShadowThrough(M7_LINE_COUNT);
+        // P2d-3 temporal gap fill: lines that got no record this frame
+        // keep LAST frame's per-line regs when those were delivered. The
+        // chain fill paints the whole gap with the gap-start values —
+        // under race record loss (cov=123/224 g=68 seen on SMK attract)
+        // that renders as vertical stripe garbage; perspective regs move
+        // well under one LSB per frame at 60 Hz, so last frame's value is
+        // the better estimate by far.
+        for (int y = 0; y < static_cast<int>(M7_LINE_COUNT); ++y) {
+          if (!line_ok_[y] && completed_line_ok_[y])
+            shadow_[y] = completed_shadow_[y];
+        }
         memcpy(completed_shadow_, shadow_, sizeof(shadow_));
         memcpy(completed_line_ok_, line_ok_, sizeof(line_ok_));
         completed_m7sel_ = m7sel_;
@@ -985,7 +1137,22 @@ class M7Daemon {
   }
   uint32_t wtdrop_acc_  = 0;  // wt drops this status window
   uint16_t wtdrop_prev_ = 0;  // last cumulative wt-drops sample
+  uint32_t wtdrop_since_dump_ = 0;  // drops since last dump trigger (surge)
   uint64_t last_render_ns_ = 0;
+  // P2d-3 render/publish instrumentation (per 5 s log window)
+  uint32_t rend_cnt_    = 0;  // RenderFrame calls this window
+  uint64_t rend_tot_ns_ = 0;  // total RenderFrame ns this window
+  uint64_t rend_max_ns_ = 0;  // slowest RenderFrame this window
+  uint32_t sync_mark_   = 0;  // syncs_ at last log window (for syncrate)
+  // Per-gate render-block counters (which sync failed to render and why)
+  uint32_t gf_mode_ = 0, gf_ready_ = 0, gf_vram_ = 0;
+  uint32_t gf_card_ = 0, gf_native_ = 0;
+  uint32_t arm_sum_ = 0, arm_n_ = 0, arm_lo_ = 65535, arm_hi_ = 0;
+  uint8_t  disp_prev_ = 0xFF;  // last stream frame's disp_row (flip counter)
+  uint8_t  disp_prev_valid_ = 0;
+  uint32_t flip_cnt_ = 0;      // disp_row transitions per 5 s window
+  uint8_t  tel_flips_ = 0;     // RTL per-frame flip count (byte 157, P2d-4)
+  uint32_t flips_max_ = 0;     // max per-frame flips this window
   uint64_t last_resync_ns_ = 0;
   // Re-request backstop. Since the P2c-4 yield cap a dump consumes only the
   // line stream's slack (~50 kB/s measured on device), so a full 2x32 KiB
@@ -1014,6 +1181,8 @@ class M7Daemon {
   uint16_t tel_drops16_   = 0;
   uint16_t tel_retry_     = 0;
   uint16_t tel_arm_       = 0;
+  uint16_t tel_wait4_     = 0;  // DM_WAIT cycles per frame, >>4 (P2d-2)
+  uint16_t tel_busy4_     = 0;  // DDRAM_BUSY cycles per frame, >>4 (P2d-2)
   uint8_t  tel_disp_row_  = 0;
   uint8_t  tel_lri_       = 0;
   uint8_t  tel_rows_[28]  = {};  // sticky row_done[223:0], rows 0..223
@@ -1029,7 +1198,8 @@ class M7Daemon {
   uint8_t  prev_mode_raw_ = 0xAA;  // last frame's raw byte 152 (agree check)
   uint8_t  mode_agree_    = 0;     // consecutive agreeing frames
   uint16_t last_tel_len_  = 0;   // debug: len of the last mode-updating frame
-  uint8_t  tel_150_[6]    = {};  // debug: raw payload[150..155] of that frame
+  uint8_t  tel_150_[6]    = {};  // debug: raw payload[150..150+6) of that frame
+  uint8_t  tel_126_[8]    = {};  // debug: raw payload[126..134) around disp_row/lri
 
   // Compact hex of a byte range for the status line (no separators).
   static std::string RowsHex(const uint8_t *b, int from, int to) {

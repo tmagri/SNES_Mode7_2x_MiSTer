@@ -1725,8 +1725,18 @@ wire [63:0] msu_ram_dout;
 
 `ifdef M7_2X_ENABLE
 // --- Frame timing: IN_VBL rising edge is the true frame boundary ---------
+// P2d-4b: gated by the LINE COUNTER too. vblank_out carries the PPU's
+// forced-blank state ($2100 bit 7 forces the V flag high), so SMK's
+// mode-change writes fire spurious vblank_out RISING EDGES mid-frame; every
+// frame_start consumer (arm/hde/flip/latency counters, header writer,
+// fs_cnt, mode latch) then reset or re-fired at a random line — arm clipped
+// to 16-222/224 with hde_falls anywhere in 89-255, per frame. ppu_y >= 223
+// passes only entries into the real vblank region (V may assert at the very
+// end of line 223 on some PPU states, hence 223 not 224; a spurious edge
+// at line 223 costs only a slightly early counter clear, while gating at
+// 224 could MISS the true edge and freeze every frame-scoped counter).
 reg  vbl_d;   // driven in the per-line record capture block below
-wire frame_start = vblank_out & ~vbl_d;
+wire frame_start = vblank_out & ~vbl_d & (ppu_y >= 9'd223);
 
 // DEBUG (M7_DEBUG_MAILBOX): OR in a free-running ~20 Hz event so the mailbox
 // writer can be validated independently of the PPU vblank chain. Production
@@ -1756,7 +1766,7 @@ reg  [15:0] last_ready_seq = 16'hFFFF;
 // Telemetry counters for the UART stream (each owned by exactly one block)
 reg [15:0] fs_cnt  = 16'd0;   // frame events (frame controller block)
 reg [15:0] cdn_cnt = 16'd0;   // ctrl_new pulses = completed ctrl polls
-reg [15:0] drt_cnt = 16'd0;   // DM_DRAIN entries = completed fetch words
+reg [15:0] drt_cnt = 16'd0;   // completed fetch words (DM_WAIT acks)
 reg [15:0] dout_cnt = 16'd0;  // DDRAM_DOUT_READY rising edges (any client)
 reg [15:0] hde_cnt = 16'd0;   // hde falls this frame (arm block)
 reg [15:0] arm_cnt = 16'd0;   // lines armed HD this frame (arm block)
@@ -2375,7 +2385,20 @@ always @(posedge clk_sys) begin
         daemon_present <= 1'b1;
         cur_buf        <= m7_ctrl_data[M7_CTRL_READY_BUF];
         last_ready_seq <= m7_ctrl_data[15:0];
-        fetch_restart  <= 1'b1;
+        // P2d-3: the per-adoption sweep restart is GONE. It fired once per
+        // ADOPTED ctrl word — once per render, up to 60/s — clearing
+        // row_done mid-frame every time, so the front_done snapshot at the
+        // vblank flip held only the rows refetched since the last adoption
+        // (measured arm=56-87/224): every later line disarmed and fell back
+        // to native output, showing a different camera than the HD top half
+        // — the fixed "stale map view bottom half" seam. The P2d-2b design
+        // made laps harmless (per-row vintage snapshot, overwrites land in
+        // the hidden slot), and the sweep runs ~2.4 laps/frame at the
+        // measured drt rate, so every row refreshes within a lap regardless.
+        // The flip in DM_ROW_END remains the only sweep reset (fetch_row <= 0
+        // + row_done <= 0 there), keeping the sweep frame-coherent.
+        // fetch_restart/fetch_pend machinery stays: dead now (nothing sets
+        // the pulse), but the watchdog abort path remains reachable.
         dump_fire      <= m7_ctrl_data[M7_CTRL_DUMP_REQ];
         if (!m7_ctrl_data[M7_CTRL_DUMP_REQ]) dump_req_arm <= 1'b1;
     end
@@ -2613,17 +2636,16 @@ reg        m7_fetch_en_s1, m7_fetch_en_s2;
 reg        cur_buf_s;
 
 localparam DM_IDLE = 3'd0, DM_ROW_END = 3'd1, DM_CTRL_WAIT = 3'd2,
-           DM_WAIT  = 3'd4, DM_DRAIN  = 3'd5;   // (DM_CTRL/DM_REQ were dead)
+           DM_WAIT  = 3'd4;                       // (DM_CTRL/DM_REQ/DM_DRAIN dead)
 reg [2:0]  dm_state = DM_IDLE;
 
 // linebuf write-port outputs. These are the SOLE drivers of the buf_wr_*
 // wires — hps_ext has been disconnected.
-reg  [7:0]  buf_wr_addr;    // native pixel index within the row (0..255, 8bpp)
+reg  [8:0]  buf_wr_addr;    // HD dot index within the row (0..511, 8bpp 2x)
 reg  [7:0]  buf_wr_data;    // CLUT index byte (linebuf expands via CLUT)
 reg         buf_wr_en;
 reg         ctrl_pend = 1'b0;   // ctrl poll request latch (sweep-starve fix)
-reg  [7:0]  last_row_id = 8'd0; // row id sitting complete in the inactive slot
-reg [14:0]  park_cnt;           // DM_ROW_END safety counter
+reg  [7:0]  last_row_id = 8'd0; // latest completed row (telemetry lri)
 
 // ddram HD client handshake (level req/ack toggles)
 reg  [28:0] dm_addr;
@@ -2632,12 +2654,40 @@ wire        dm_ack;
 wire [63:0] dm_dout;
 
 reg  [8:0]  fetch_row  = 9'd0;   // row currently being fetched (0..223)
-reg  [7:0]  fetch_word = 8'd0;   // 64-bit word within the row (0..31, 8bpp)
-reg  [63:0] dm_word;              // latched read (stable through DM_DRAIN)
-reg  [2:0]  px_byte;              // byte within the 64-bit word (0..7)
-reg  [255:0] row_done = 256'd0;  // sticky: row ready for display
+reg  [7:0]  fetch_word = 8'd0;   // 64-bit word within the row (0..63, 8bpp 2x)
+reg  [63:0] dm_word;              // latched read (telemetry: last word)
+reg  [255:0] row_done = 256'd0;  // rows fetched into the (hidden) slot this sweep
+reg  [255:0] front_done = 256'd0; // vintage snapshot: rows fresh in the DISPLAYED
+                                  // slot (taken at the vblank slot flip, P2d-2b)
+reg  [7:0]  disp_row = 8'hFF;    // telemetry: id of the slot being displayed
 reg         fetch_restart = 1'b0;    // frame controller: new frame adopted
 reg         fetch_pend = 1'b0;   // restart waiting for the bus to go idle
+reg         m7_swapped = 1'b0;   // one slot flip per frame (P2d-2b; P2d-4 keys
+                                 //   the window on ppu_y, not vblank_out)
+reg  [3:0]  m7_flip_cnt = 4'd0;  // flips this frame (telemetry, byte 157)
+reg  [2:0]  m7_mode_latch = 3'd0;  // bgmode at frame_start (P2d-4 arm gate)
+
+// Byte-push runs as a DRAIN ENGINE parallel to the fetch FSM (P2d-2): each
+// acked word is handed off below and the FSM issues the next word right
+// away, overlapping the 8-cycle linebuf push with the next port round
+// trip. Before this, DM_DRAIN serialized those 8 cycles after every word
+// (~51 cycles/word measured; the frame budget allows ~25).
+reg  [63:0] dr_word;              // word being pushed to the linebuf
+reg  [8:0]  dr_row;               // row the pushed word belongs to
+reg  [5:0]  dr_widx;              // word index within the row (buf_wr_addr)
+reg  [2:0]  dr_byte;              // next byte to push (0..7)
+reg         dr_run = 1'b0;       // engine busy
+// (the old drain_ok issue gate is gone: dr_* regs are disjoint from the
+// issue-path regs, so the gate only added up to 7 stalled cycles/word)
+
+// Latency attribution (P2d-2), cleared each frame_start, exported >>4:
+//   dm_wait_cyc — cycles the FSM spent in DM_WAIT (port round trip plus
+//                 any waiting behind rom/MSU slots),
+//   busy_cyc    — cycles DDRAM_BUSY was high (ARM traffic holding the
+//                 controller). Dividing by the frame's fetch words splits
+//                 the ~43 cycles/word into port latency vs contention.
+reg  [19:0] dm_wait_cyc = 20'd0;
+reg  [19:0] busy_cyc    = 20'd0;
 
 // Watchdog: a fetch word that hasn't returned in 8192 clk_sys (~380 µs)
 // aborts the FSM so a dead port degrades to "no HD lines" instead of
@@ -2645,7 +2695,7 @@ reg         fetch_pend = 1'b0;   // restart waiting for the bus to go idle
 reg  [12:0] dm_watchdog = 13'd0;
 reg         dm_wd_evt   = 1'b0;  // sticky for the LED panel
 
-// Row stride is 32 words (256 native bytes, 8bpp): offset = {row, word[4:0]}.
+// Row stride is 64 words (512 HD bytes, 8bpp 2x): offset = {row, word[5:0]}.
 wire [28:0] dm_word_addr = (cur_buf_s ? M7_PIXBUF_B_WORD : M7_PIXBUF_WORD)
                            + {fetch_row, fetch_word[5:0]};
 
@@ -2656,8 +2706,6 @@ always @(posedge clk_sys) begin
     ctrl_req_s1 <= ctrl_req;      ctrl_req_s2  <= ctrl_req_s1; ctrl_req_s3 <= ctrl_req_s2;
     m7_fetch_en_s1 <= m7_fetch_en; m7_fetch_en_s2 <= m7_fetch_en_s1;
     cur_buf_s   <= cur_buf;       // quasi-static (changes once per frame)
-
-    buf_wr_en <= 1'b0;
 
     // Ctrl-poll request latch: the sweep keeps dm_req!=dm_ack most cycles,
     // so the 1-cycle ctrl_req_pulse used to be missed ~95% of the time
@@ -2673,6 +2721,19 @@ always @(posedge clk_sys) begin
         dm_watchdog <= dm_watchdog + 13'd1;
     else
         dm_watchdog <= 13'd0;
+
+    // Frame-scoped latency counters (P2d-2). The clear wins by being last.
+    if (dm_state == DM_WAIT) dm_wait_cyc <= dm_wait_cyc + 20'd1;
+    if (DDRAM_BUSY)          busy_cyc    <= busy_cyc    + 20'd1;
+    if (frame_start) begin
+        dm_wait_cyc <= 20'd0;
+        busy_cyc    <= 20'd0;
+        m7_flip_cnt <= 4'd0;   // frame-scoped flip count (telemetry, byte 157)
+        m7_mode_latch <= bgmode_out;  // mode this frame STARTED with (P2d-4)
+    end
+    // P2d-4: re-arm the once-per-frame flip on the LINE COUNTER, not the
+    // glitchy vblank_out level (see the DM_ROW_END flip comment).
+    if (ppu_y < 9'd224) m7_swapped <= 1'b0;   // re-arm the once-per-frame flip
 
     // While a restart is pending the FSM must not issue anything: an
     // in-flight read completes on its own (ddram toggles dm_ack unaided)
@@ -2712,62 +2773,104 @@ always @(posedge clk_sys) begin
                 dm_wd_evt <= 1'b1;
                 dm_state  <= DM_IDLE;
             end else if (dm_req == dm_ack) begin
-                dm_word  <= dm_dout;
-                px_byte  <= 3'd0;
+                // Hand the word to the drain engine and issue the next one
+                // right away (P2d-2): the 8-cycle linebuf push overlaps the
+                // next port round trip instead of serializing after it.
+                dm_word  <= dm_dout;           // telemetry: last word read
+                dr_word  <= dm_dout;
+                dr_row   <= fetch_row;
+                dr_widx  <= fetch_word[5:0];
+                dr_run   <= 1'b1;
+                dr_byte  <= 3'd0;
                 drt_cnt  <= drt_cnt + 16'd1;   // telemetry: fetch words done
-                dm_state <= DM_DRAIN;
-            end
-        end
-
-        // Push the word's 8 CLUT index bytes into the linebuf (one byte per
-        // cycle, little-endian in the 64-bit word). The linebuf expands via
-        // its CLUT at read; the row completes after word 31's last byte.
-        DM_DRAIN: begin
-            buf_wr_addr <= {fetch_word[5:0], px_byte};
-            buf_wr_data <= dm_word[px_byte*8 +: 8];
-            buf_wr_en <= 1'b1;
-            px_byte   <= px_byte + 3'd1;
-            if (px_byte == 3'd7) begin
                 if (fetch_word == 8'd63) begin
-                    row_done[fetch_row] <= 1'b1;
-                    last_row_id <= fetch_row[7:0];
+                    // Row boundary: wrap the indices for the next row's
+                    // first word. The boundary goes through DM_ROW_END,
+                    // which does the vblank slot flip when one is due and
+                    // otherwise passes straight through (P2d-2b) — the
+                    // sweep free-runs and laps are harmless now that the
+                    // arm reads per-row vintages instead of position.
                     fetch_word <= 8'd0;
                     fetch_row  <= (fetch_row == 9'd223) ? 9'd0 : fetch_row + 9'd1;
-                    park_cnt   <= 15'd0;
-                    // Row complete: park until the display side consumes
-                    // the boundary (row_adv, pulsed at the next hde fall).
-                    // This keeps the linebuf slot swap atomic — the writer
-                    // can never straddle one mid-row — and rate-limits the
-                    // sweep to the display pace. Safety counter un-wedges
-                    // a park with no hde falls (video gone).
-                    // Row 0 skips the park (P2c-7): right after the adoption
-                    // restart it must run straight into row 1 so the vblank
-                    // pre-fetches BOTH rows the arm gate needs at the first
-                    // visible hde fall (row_done[1]). Without this the gated
-                    // park never releases during vblank and every line falls
-                    // back native, one row behind the arm gate forever.
-                    dm_state <= (fetch_row == 9'd0) ? DM_IDLE : DM_ROW_END;
+                    dm_state   <= DM_ROW_END;
                 end else begin
                     fetch_word <= fetch_word + 8'd1;
-                    dm_state <= DM_IDLE;
+                    dm_state   <= DM_IDLE;
                 end
             end
         end
 
         DM_ROW_END: begin
-            park_cnt <= park_cnt + 15'd1;
-            if (row_adv || (&park_cnt))
-                dm_state <= DM_IDLE;
+            // Frame-coherent slot swap (P2d-2b). The per-line swap (v3/P2d-2)
+            // flipped act on EVERY armed line while tracking — last_row_id and
+            // disp_row differ by one all frame — so armed lines alternated
+            // between two slots of different content vintages, and rows beyond
+            // the writer's per-frame reach sat in slots untouched for many
+            // swaps (the fixed seam + flyby-era map view in the race shots).
+            // The arm gate checked writer POSITION, never slot vintage.
+            // Now: one flip per frame, here — a row boundary in vblank, so no
+            // row splits across slots — carrying the per-row vintage snapshot
+            // with it: front_done[R] = the newly displayed slot holds row R
+            // fresh. The arm gate (below) reads only that snapshot, which
+            // makes laps harmless too: whatever the writer overwrites lands
+            // in the hidden slot and only surfaces at the NEXT flip.
+            // Hold for the drain engine to land row completion's last byte
+            // (<=7 cycles) so row_done[R] is set BEFORE the snapshot takes
+            // it — otherwise the boundary row is written into the newly
+            // front slot but never marked fresh in it, and its done bit
+            // leaks into the next sweep's generation.
+            // P2d-4: the flip window keys on ppu_y, NOT vblank_out. vblank_out
+            // glitches low mid-vblank (measured fl=106-120 flips/s = ~2/frame
+            // on the P2d-3 bitstream; each extra flip cut the front_done
+            // generation to a half-lap ~87-172 rows, which the arm gate then
+            // reported as the partial HD/native boundary). ppu_y is the PPU's
+            // solid line counter — NTSC vblank is exactly ppu_y 224..261 — so
+            // m7_swapped (re-armed when ppu_y < 224, below) can only set once
+            // per frame and the snapshot is always a whole generation.
+            if ((ppu_y >= 9'd224) && !m7_swapped) begin
+                if (!dr_run) begin
+                    act        <= ~act;
+                    front_done <= row_done;
+                    row_done   <= 256'd0;
+                    fetch_row  <= 9'd0;
+                    disp_row   <= {7'd0, ~act}; // telemetry: front slot id
+                    m7_swapped <= 1'b1;
+                    m7_flip_cnt <= m7_flip_cnt + 4'd1; // telemetry: flips/frame
+                    dm_state   <= DM_IDLE;
+                end
+                // else: hold here until the drain finishes, then flip
+            end else
+                dm_state <= DM_IDLE;  // pass through — lap-safe now, the
+                                      // position park is retired
         end
     endcase
+
+    // Linebuf drain engine (P2d-2): pushes the handed-off word's 8 CLUT
+    // index bytes into the slot RAM, one per cycle, little-endian. Row
+    // completion (word 63's last byte) sets row_done/last_row_id here —
+    // 8 cycles after the ack, which is why DM_ROW_END holds on fetch_row.
+    buf_wr_en <= 1'b0;
+    if (dr_run) begin
+        buf_wr_addr <= {dr_widx, dr_byte};
+        buf_wr_data <= dr_word[dr_byte*8 +: 8];
+        buf_wr_en   <= 1'b1;
+        dr_byte     <= dr_byte + 3'd1;
+        if (dr_byte == 3'd7) begin
+            dr_run <= 1'b0;
+            if (dr_widx == 6'd63) begin
+                row_done[dr_row] <= 1'b1;
+                last_row_id      <= dr_row[7:0];
+            end
+        end
+    end
 
     // New daemon frame adopted: restart the sweep from row 0 with clean
     // done bits (the frame controller sets this pulse at adoption time).
     // The reset WAITS for an idle bus — dropping the FSM out of DM_WAIT
     // with a transaction outstanding would misattribute the old read's ack
-    // to the next issue (stale word + swallowed request), and dropping out
-    // of DM_DRAIN would write the word's second pair to the wrong
-    // row/word (fetch_row/fetch_word reset before the write fires).
+    // to the next issue (stale word + swallowed request). Killing the
+    // drain engine (dr_run) at the same point stops a stale word's bytes
+    // from landing in a slot whose row_done was just cleared.
     // Worst cost of waiting: one word of the old sweep still lands in the
     // linebuf, refetched anyway next sweep.
     if (fetch_restart) begin          // one-cycle pulse from the frame ctrl
@@ -2780,14 +2883,14 @@ always @(posedge clk_sys) begin
             dm_state   <= DM_IDLE;
             fetch_row  <= 9'd0;
             fetch_word <= 8'd0;
-            px_byte    <= 3'd0;
+            dr_run     <= 1'b0;   // kill any in-flight byte push (P2d-2)
             row_done   <= 256'd0;
         end else if (dm_req == dm_ack) begin
             fetch_pend <= 1'b0;
             dm_state   <= DM_IDLE;   // covers DM_WAIT whose ack just landed
             fetch_row  <= 9'd0;
             fetch_word <= 8'd0;
-            px_byte    <= 3'd0;
+            dr_run     <= 1'b0;   // kill any in-flight byte push (P2d-2)
             row_done   <= 256'd0;
         end
     end
@@ -2800,19 +2903,22 @@ end
 // otherwise the line falls back to native output.
 reg        hde_d;
 reg        m7_line_hd = 1'b0;
-reg        row_adv = 1'b0;          // one-clk pulse: fetch FSM may leave park
-reg  [7:0] disp_row = 8'hFF;        // row id currently in the displayed slot
-                                    // (act itself is declared by the instance)
+reg        row_adv = 1'b0;          // TELEMETRY ONLY since P2d-2: hde fall
+                                    // while parked (the FSM no longer gates
+                                    // its park release on this — see the
+                                    // position-based park in DM_ROW_END)
 
 // hde_cnt/arm_cnt reset at each frame_start: arm_cnt = lines that showed
 // the HD buffer this frame — the fetch-throughput measurement.
 //
-// Slot swap policy (v3): at each hde fall, if this line's row was fetched
-// and the inactive slot holds a COMPLETED row the display hasn't shown
-// yet, swap slots. The parked writer (DM_ROW_END) guarantees the swap is
-// atomic; lines between fresh rows repeat the displayed row. row_adv
-// releases the parked FSM at the same edge so the next row starts into
-// the slot that just became inactive.
+// Slot policy (v5, P2d-2b): the slot flip happens ONCE per frame in the
+// FSM (DM_ROW_END at a vblank row boundary) and carries the front_done
+// vintage snapshot with it. This block only READS that snapshot per line:
+// arm iff this line's row is fresh in the displayed slot. No per-line
+// state changes here at all — the v3/P2d-2 per-line act flip alternated
+// slots on consecutive armed lines during tracking (last_row_id and
+// disp_row differ by one all frame), mixing two content vintages in one
+// frame.
 always @(posedge clk_sys) begin
     hde_d <= HBlank_out;
     row_adv <= 1'b0;
@@ -2821,13 +2927,7 @@ always @(posedge clk_sys) begin
         arm_cnt <= 16'd0;
     end else if (~HBlank_out & hde_d) begin
         hde_cnt <= hde_cnt + 16'd1;
-        // Vblank gate (P2c-7 alignment fix): the park must NOT release on
-        // vblank hde falls. The NTSC vblank is ~38 lines; letting the writer
-        // run there laps it ~36-38 rows ahead of scanout and the whole frame
-        // displays row L+36 at line L (measured: dr=187 at py=151). With the
-        // gate the writer holds at most the park's one-row lead and line L
-        // shows row L. The park's own safety counter (park_cnt full ≈ 1.5ms)
-        // still un-wedges a park longer than vblank if video dies.
+        // Telemetry only (P2d-2): the FSM park no longer consumes this.
         row_adv <= (dm_state == DM_ROW_END) && ~vblank_out;
         // BGMODE gate (P2c-8): adopt/park only while $2105 says the screen is
         // a real Mode 7 frame. M7SEL is NOT a mode indicator (it holds 0x8 /
@@ -2837,15 +2937,27 @@ always @(posedge clk_sys) begin
         // CGRAM palette = solid horizontal stripes. Gating here freezes
         // adoption (m7_line_hd falls -> native fallback) AND arm_cnt, while
         // the daemon's tel_mode_ publish gate stops the writes at the source.
-        if (m7_fetch_en && (ppu_y < 9'd223) && (bgmode_out == 3'd7)) begin
-            if (row_done[ppu_y + 9'd1]) begin
+        // P2d-4 arm gate: per-line bgmode_out==7 OR the frame-latched mode
+        // (sampled at frame_start, above). SMK's vblank routine writes $2105=0
+        // transiently mid-frame (the P2d-3 flap); the per-line gate disarmed
+        // every line after the transient — arm clipped to the transient's
+        // landing line (the stable arm=87) and those lines fell back native.
+        // The latch says "this frame STARTED as a mode-7 frame" — a mid-frame
+        // transient no longer disarms the rest of the frame, while frames
+        // that genuinely start non-7 stay native (split modes keep working).
+        if (m7_fetch_en && (ppu_y < 9'd223) &&
+            ((bgmode_out == 3'd7) || (m7_mode_latch == 3'd7))) begin
+            // Frame-coherent arm (P2d-2b). front_done[R] is set iff the
+            // displayed slot's row R was completed in the last sweep — the
+            // snapshot taken at the vblank flip. Armed lines therefore
+            // show EXACTLY this line's row, fresh from the previous
+            // frame; rows the writer did not reach fall back to native.
+            // The ±1 keeps the established tolerance for the line-index
+            // edge (adjacent-scanline matrix delta = well under a pixel).
+            m7_line_hd <= front_done[ppu_y[7:0]]
+                       || front_done[(ppu_y[7:0] + 8'd1)];
+            if (m7_line_hd)
                 arm_cnt <= arm_cnt + 16'd1;
-                if (last_row_id != disp_row) begin
-                    act      <= ~act;
-                    disp_row <= last_row_id;
-                end
-            end
-            m7_line_hd <= row_done[ppu_y + 9'd1];
         end else
             m7_line_hd <= 1'b0;
     end
@@ -2950,7 +3062,13 @@ assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
 assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
 assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
 assign dbg_bytes[1223:1216] = {5'b0, bgmode_out};     // [152] $2105 BGMODE low bits (0xAA filler on pre-build-8 bitstreams)
-assign dbg_bytes[2047:1224] = {103{32'hAAAA_AAAA}};   // filler (bytes 153..255)
+// P2d-2 latency attribution: frame-scoped (cleared at frame_start) cycle
+// counts >>4. Divide by the frame's fetch words (= fr*32, fr = words/32)
+// to get cycles/word; busy/(frame cycles) gives the ARM contention share.
+assign dbg_bytes[1239:1224] = dm_wait_cyc[19:4];      // [154..155] DM_WAIT cyc >>4
+assign dbg_bytes[1255:1240] = busy_cyc[19:4];         // [155..156] BUSY cyc >>4
+assign dbg_bytes[1263:1256] = {4'b0000, m7_flip_cnt}; // [157] flips this frame (P2d-4)
+assign dbg_bytes[2047:1264] = {98{32'hAAAA_AAAA}};    // filler (bytes 158..255)
 
 wire m7_stream_txd;
 m7_reg_stream #(
