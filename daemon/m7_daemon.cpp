@@ -187,13 +187,18 @@ class M7Daemon {
     std::cout << "P2c Mode 7 software renderer (per-line register + VRAM stream)"
               << std::endl;
 
-    FillCard(0, 0);
-    FillCard(1, 0);
-    cur_pub_ = 0;
-    ready_seq_ = 1;
-    PublishCtrl(CtrlWord(ready_seq_, cur_pub_, false));
-    std::cout << "ctrl published (ready_seq=1, READY_BUF=0, FMT8) — FPGA "
-                 "should start fetching" << std::endl;
+    if (!native_only_) {
+      FillCard(0, 0);
+      FillCard(1, 0);
+      cur_pub_ = 0;
+      ready_seq_ = 1;
+      PublishCtrl(CtrlWord(ready_seq_, cur_pub_, false));
+      std::cout << "ctrl published (ready_seq=1, READY_BUF=0, FMT8) — FPGA "
+                   "should start fetching" << std::endl;
+    } else {
+      std::cout << "M7_NATIVE: no ctrl word published — native M7_HD "
+                   "rendering alone" << std::endl;
+    }
 
     uint64_t log_last = now_ns();
     uint32_t log_mark = 0;
@@ -213,8 +218,12 @@ class M7Daemon {
       // render until the initial VRAM snapshot is complete as well.
       if (syncs_ != last_syncs) {
         last_syncs = syncs_;
+        // M7_STATIC never renders: the FillCard gradient stays in both
+        // buffers forever, so any HD line on screen is unambiguously the
+        // card (a one-frame scene freeze is indistinguishable from the
+        // live game in stills — the earlier static runs proved nothing).
         if (completed_frame_ready_ && vram_valid_ && tel_mode_ == 7 &&
-            (!static_card_ || !published_frame)) {
+            !static_card_ && !native_only_) {
           cur_pub_ ^= 1u;
           RenderFrame(cur_pub_);
           PublishCtrl(CtrlWord(++ready_seq_, cur_pub_, false));
@@ -235,8 +244,8 @@ class M7Daemon {
       // the renderer is actually publishing (the yield cap keeps line
       // coverage alive during dumps, and dstat outranks chunks so
       // completions still land promptly).
-      if (!dump_requested_ && !dump_req_pending_ && vram_valid_ &&
-          now - last_render_ns_ < 2000000000ull &&
+      if (!native_only_ && !dump_requested_ && !dump_req_pending_ &&
+          vram_valid_ && now - last_render_ns_ < 2000000000ull &&
           now - last_resync_ns_ >= ResyncInterval()) {
         last_resync_ns_   = now;
         dump_req_pending_ = true;
@@ -318,6 +327,11 @@ class M7Daemon {
  private:
   // M7_STATIC=1 freezes the card after the initial fill (display-path proof)
   const bool static_card_ = std::getenv("M7_STATIC") != nullptr;
+  // M7_NATIVE=1 never publishes a ctrl word: daemon_present stays 0, the
+  // HD overlay never arms, and the screen shows the PPU's native M7_HD
+  // (True HD Mode 7, 2x) rendering alone — the on-device proof capture of
+  // the native path with no overlay contribution at all.
+  const bool native_only_ = std::getenv("M7_NATIVE") != nullptr;
 
   // Extended baud constants (B3000000+) are Linux-only; fall back to the
   // raw numeric value so the source still syntax-checks on macOS hosts.

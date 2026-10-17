@@ -500,3 +500,29 @@ set). Verified byte-for-byte against the daemon's parser by simulation
 before hardware; the daemon's SIGUSR1 dump prints a
 `palindrome fields: N/1792` counter — near-zero on v6 hardware, near-all
 before.
+
+## REVISION v7 — HD 2x geometry fix (2026-10-17)
+
+The pixel-buffer geometry changed: rows are now **512 HD dots** (2x the 256
+native lores pixels), and the display strobe rate is **2 strobes per native
+lores pixel** (1024 CLK_VIDEO cycles per line, `M7_HD_SCALE = 2`).
+
+Why: the video path outputs 1024 px per line (512 hires dots, 4 CLK_VIDEO
+cycles per dot, `ce_pix` once per dot). At the old scale 4 the strobe
+generator emitted 4 strobes per dot = 2048 per line, so the linebuf's
+10-bit read pointer wrapped at 1024 and every line displayed its row TWICE
+side by side (left half = the full row stretched 2x, right half = the same
+row again) — on screen: "everything Mode 7 is very stretched wide" with a
+seam and a repeated texture. At scale 2 the generator emits exactly 2
+strobes per dot (strobe on the first two CLK_VIDEO cycles of each dot),
+rd_x counts 0..511, and the slot index is rd_x directly.
+
+Row layout (8bpp): row r lives at word offset r*64 from the buffer base
+(`{r, fetch_word[5:0]}`, 64 64-bit words = 512 B). Buffer slots are
+unchanged (0x70000 each; 224*512 B = 0x1C000 used).
+
+Sampling: dot 2k samples the lores pixel k coordinate; dot 2k+1 samples it
+offset by half a matrix step (`regs.a / 2`, `regs.c / 2` in the 8.8
+domain, truncated toward zero) — the exact semantics of the PPU's native
+HD path (PPU.vhd `M7_VRAM_X2 = M7_VRAM_X + M7A/2`), so the overlay and the
+native renderer agree per dot.

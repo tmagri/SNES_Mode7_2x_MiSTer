@@ -2605,7 +2605,7 @@ end
 
 // Address convention (rtl/m7_abi.svh): DDRAM_ADDR is a 64-bit WORD address
 // (physical byte >> 3); row r of the pixel buffer lives at word offset
-// r*32 from the buffer base, i.e. {r, fetch_word[4:0]} (8bpp, 256 B/row).
+// r*32 from the buffer base, i.e. {r, fetch_word[5:0]} (8bpp, 512 B/row).
 reg  ctrl_req_s1, ctrl_req_s2, ctrl_req_s3;
 wire ctrl_req_pulse = ctrl_req_s2 ^ ctrl_req_s3;
 
@@ -2647,7 +2647,7 @@ reg         dm_wd_evt   = 1'b0;  // sticky for the LED panel
 
 // Row stride is 32 words (256 native bytes, 8bpp): offset = {row, word[4:0]}.
 wire [28:0] dm_word_addr = (cur_buf_s ? M7_PIXBUF_B_WORD : M7_PIXBUF_WORD)
-                           + {fetch_row, fetch_word[4:0]};
+                           + {fetch_row, fetch_word[5:0]};
 
 always @(posedge clk_sys) begin
     // 3FF synchronisers for the frame-controller toggles/quasi-static
@@ -2723,12 +2723,12 @@ always @(posedge clk_sys) begin
         // cycle, little-endian in the 64-bit word). The linebuf expands via
         // its CLUT at read; the row completes after word 31's last byte.
         DM_DRAIN: begin
-            buf_wr_addr <= {fetch_word[4:0], px_byte};
+            buf_wr_addr <= {fetch_word[5:0], px_byte};
             buf_wr_data <= dm_word[px_byte*8 +: 8];
             buf_wr_en <= 1'b1;
             px_byte   <= px_byte + 3'd1;
             if (px_byte == 3'd7) begin
-                if (fetch_word == 8'd31) begin
+                if (fetch_word == 8'd63) begin
                     row_done[fetch_row] <= 1'b1;
                     last_row_id <= fetch_row[7:0];
                     fetch_word <= 8'd0;
