@@ -473,3 +473,30 @@ buffer, 256×224) + `/tmp/m7_dbg.txt` (per-line reg shadow, `m7sel`,
 tilemap distinct/nonzero histogram, tileset bytes). Proven
 2026-10-17: the title-screen "stripes" decoded as the CORRECT render of
 SMK's zoomed-out title map (a=b=−23645 ⇒ scale ≈ 0.011, wrap fill).
+
+# REVISION v6 — record-walk implementation fix (2026-10-17, P2c-9)
+
+The wire format above did **not** change. This note documents an RTL bug
+that violated it silently from P2c-2 until this revision, because every
+capture taken in that window shows its signature.
+
+The FPGA's payload-walk LUT (`rm_val` in SNES.sv) mapped **two mask bits
+per field** (bit0=A.lo, bit1=A.hi, …) with no step-parity selector, while
+the mask carries one bit per field and the walk clears a bit per byte
+pair. Every value byte was therefore emitted **doubled**, and the
+X/Y/HOFS/VOFS LUT entries were unreachable (casez priority matched the
+A/B/C/D patterns first). `cur_mask` also ordered bits 4/5 (X/Y) and 6/7
+(HOFS/VOFS) opposite to `M7_RECF_*`. Net effect on the wire: values that
+decoded as doubled-byte palindromes (0x3636, 0x4B4B, 0xFFFF…) or zeros —
+a capture whose per-line registers are all palindromic is a pre-v6
+capture, not real data.
+
+The fix walks one bit per field via a priority chain (`M7_RECF_A..VOFS`
+lsb-first), selects lo/hi by step parity (value pairs occupy steps
+(3,4),(5,6),…; odd step = lo byte), and orders `cur_mask` exactly as
+`M7_RECF_*`. The 0xFE sync's M7SEL tail is selected only when
+`rec_rm[7:0]` is fully cleared (the sync seeds the walker with bit 8
+set). Verified byte-for-byte against the daemon's parser by simulation
+before hardware; the daemon's SIGUSR1 dump prints a
+`palindrome fields: N/1792` counter — near-zero on v6 hardware, near-all
+before.

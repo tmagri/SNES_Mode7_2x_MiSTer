@@ -858,12 +858,30 @@ class M7Daemon {
           << " cx=" << r.x << " cy=" << r.y << " hofs=" << r.hofs
           << " vofs=" << r.vofs << "\n";
       }
-      // Tilemap health: the Mode 7 map is flat bytes 0x4000..0x7FFF. A live
-      // SMK map has hundreds of distinct tile indices; a stale/zeroed image
-      // collapses to one or two values — that split decides the diagnosis.
+      // Register-stream health: the pre-P2c-9 FPGA walk emitted every
+      // payload byte doubled, so each corrupted 16-bit field read back as a
+      // doubled-byte palindrome (0x3636, 0x4B4B, ...). Real register data is
+      // almost never palindromic across a whole frame — a healthy stream
+      // shows a handful of chance palindromes; the old bug showed all 1792.
+      unsigned pal = 0, fld = 0;
+      for (int y = 0; y < h; ++y) {
+        const M7Regs &r = completed_shadow_[y];
+        const uint16_t vs[8] = {
+            static_cast<uint16_t>(r.a), static_cast<uint16_t>(r.b),
+            static_cast<uint16_t>(r.c), static_cast<uint16_t>(r.d),
+            r.x, r.y, r.hofs, r.vofs};
+        for (int f = 0; f < 8; ++f) {
+          ++fld;
+          if ((vs[f] >> 8) == (vs[f] & 0xFF)) ++pal;
+        }
+      }
+      t << "palindrome fields: " << pal << "/" << fld << "\n";
+      // Tilemap health: the Mode 7 map is plane-1 words 0x0000..0x3FFF (see
+      // the layout note in m7_mode7_renderer.h). A live SMK map has hundreds
+      // of distinct tile indices; a stale/zeroed image collapses to one or
+      // two values — that split decides the diagnosis.
       uint32_t hist[256] = {};
-      for (unsigned i = 0; i < 16384u; ++i)
-        ++hist[m7::vram7_byte(loc_v1_, loc_v2_, 0x4000u + i)];
+      for (unsigned i = 0; i < 16384u; ++i) ++hist[loc_v1_[i]];
       unsigned distinct = 0, nonzero = 0;
       for (int v = 1; v < 256; ++v)
         if (hist[v]) {
@@ -873,8 +891,7 @@ class M7Daemon {
       t << "tilemap: distinct=" << distinct << " nonzero=" << nonzero
         << "/16384 tile0=" << hist[0] << "\ntileset[0..15]:";
       for (unsigned i = 0; i < 16; ++i)
-        t << " " << std::hex
-          << static_cast<int>(m7::vram7_byte(loc_v1_, loc_v2_, i)) << std::dec;
+        t << " " << std::hex << static_cast<int>(loc_v2_[i]) << std::dec;
       t << "\n";
     }
     std::cout << "debug dump written to /tmp/m7_dbg.pgm + /tmp/m7_dbg.txt"

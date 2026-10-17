@@ -52,32 +52,22 @@ inline bool coordinate_inside_map(int32_t fixed) {
   return fixed >= 0 && fixed < (1024 * 256);
 }
 
-// Flat VRAM byte at address b. SNES VRAM is a flat 64 KiB byte space; the
-// core stores it as two 8-bit byte planes (port A / port B of the word-wide
-// memory), so byte b lives in plane (b & 1) at word b >> 1. Both Mode 7
-// fetches — the tilemap entry AND the character pixel — are flat byte
-// addresses and must go through this split. (An earlier model treated
-// plane 1 as "the tilemap array" and plane 2 as "the pixel array" at the
-// same word index; that renders solid-color tiles correctly by accident
-// and turns every detailed tile into per-pixel noise.)
-inline uint8_t vram7_byte(const uint8_t *v1, const uint8_t *v2,
-                          unsigned byte_addr) {
-  return (byte_addr & 1) ? v2[byte_addr >> 1] : v1[byte_addr >> 1];
-}
-
 // --------------------------------------------------------------------------
-// render_line — software Mode 7 rasterizer for one scanline.
+// Mode 7 VRAM layout — SNES word space, as fetched by the PPU (PPU.vhd):
 //
-// SNES Mode 7 VRAM layout (flat byte space):
-//   0x0000-0x3FFF — character data: 256 tiles x 64 bytes (8x8, 1 byte/px)
-//   0x4000-0x7FFF — tilemap: 128x128 entries, one byte each (tile index)
+//   The Mode 7 window is the 16K-word region 0x0000-0x3FFF. Each word holds
+//   TWO fetchable bytes in separate planes:
+//     word i, plane 1 (the $2118 byte) = tilemap entry i   (128x128, 1 B/word)
+//     word i, plane 2 (the $2119 byte) = character byte i  (256x64 tiles)
+//   The PPU's tilemap fetch (port A) reads vram1, the character fetch
+//   (port B) reads vram2 — both at the same 14-bit word index. There is no
+//   flat byte space and no 0x4000 offset: an earlier model that interleaved
+//   the planes by byte parity made half the tilemap view read character
+//   bytes and half the character view read tilemap entries, which rendered
+//   as column-interleaved noise with speckled far field.
 //
-// The daemon receives VRAM as two byte-plane arrays (word-indexed):
-//   vram1[] = even flat bytes, vram2[] = odd flat bytes — see vram7_byte.
-//
-// The pixel buffer stores one CLUT index per native pixel (8bpp).
-// Index 0 = transparent — the FPGA compositing mux will show the native
-// pixel stream underneath, allowing sprites and HUD to render on top.
+// vram1[] / vram2[] are the two byte planes, word-indexed (32768 words
+// each): vram1[w] = word w's low byte, vram2[w] = word w's high byte.
 // --------------------------------------------------------------------------
 inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
                        bool extbg, const uint8_t *vram1,
@@ -129,13 +119,13 @@ inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
     const unsigned map_addr = (map_y >> 3) * 128 + (map_x >> 3);
 
     // M7SEL=11 substitutes tile zero outside the 1024x1024 map.
-    const unsigned tile = (outside && overflow == 3)
-                              ? 0
-                              : vram7_byte(vram1, vram2, 0x4000u + map_addr);
+    // Tilemap: 128x128 one-byte entries, plane 1 at word = map_addr.
+    const unsigned tile =
+        (outside && overflow == 3) ? 0 : vram1[map_addr];
 
-    // Character data: fixed at flat byte 0, tile*64 + row*8 + col.
+    // Character data: plane 2, word = tile*64 + row*8 + col.
     const unsigned char_addr = tile * 64 + tile_row * 8 + tile_col;
-    const uint8_t pixel = vram7_byte(vram1, vram2, char_addr);
+    const uint8_t pixel = vram2[char_addr];
 
     // EXTBG mode: bit 7 is the BG2 priority flag, bits 6:0 are the
     // color index (into CGRAM entries 0-127). For BG1 (no EXTBG bit set),
