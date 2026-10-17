@@ -17,15 +17,16 @@ M7Regs identity_regs() {
   return regs;
 }
 
-// Set a pixel in VRAM matching the SNES Mode 7 memory layout: a flat byte
-// space split across two byte planes (even flat bytes in vram1, odd in
-// vram2, each word-indexed by flat>>1). Tilemap entries live at flat
-// 0x4000+ty*128+tx; character pixels at flat tile*64+row*8+col.
+// Set a pixel in VRAM matching the SNES Mode 7 layout as fetched by the
+// PPU (see the layout note in m7_mode7_renderer.h): the Mode 7 window is
+// 16K words, each holding two fetchable bytes in separate planes —
+// plane 1 word i = tilemap entry i (128x128, 1 B/word), plane 2 word
+// tile*64+row*8+col = character pixel bytes.
 void set_pixel(unsigned map_x, unsigned map_y, uint8_t tile, uint8_t pixel) {
-  const unsigned map_addr = 0x4000u + (map_y >> 3) * 128 + (map_x >> 3);
+  const unsigned map_addr = (map_y >> 3) * 128 + (map_x >> 3);
   const unsigned char_addr = tile * 64 + (map_y & 7) * 8 + (map_x & 7);
-  (map_addr & 1 ? vram2 : vram1)[map_addr >> 1] = tile;
-  (char_addr & 1 ? vram2 : vram1)[char_addr >> 1] = pixel;
+  vram1[map_addr] = tile;
+  vram2[char_addr] = pixel;
 }
 
 void clear_vram() {
@@ -73,7 +74,8 @@ int main() {
   clear_vram();
   set_pixel(0, 0, 1, 0x41);
   // Also set tile 0's pixel at (0,0) in char data for mode 11 test
-  vram1[0] = 0x77;  // tile 0, row 0, col 0 -> flat byte 0 (even, plane 1)
+  vram2[0] = 0x77;  // tile 0, row 0, col 0 -> plane 2 word 0; overflow mode
+                    // 11 substitutes tile zero, whose fetch reads this byte
   regs = {};
   regs.x = 1024;  // map coordinate is outside while the matrix is zero
   m7::render_line(regs, 0, 0x00, false, vram1, vram2, line);

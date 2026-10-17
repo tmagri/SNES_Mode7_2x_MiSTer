@@ -1957,36 +1957,52 @@ function [3:0] popcnt8(input [7:0] m);
             + {3'd0,m[4]} + {3'd0,m[5]} + {3'd0,m[6]} + {3'd0,m[7]};
 endfunction
 
-wire [7:0] cur_mask = {rc_h != m7hofs_out, rc_v != m7vofs_out,
-                       rc_x != m7x_out,      rc_y != m7y_out,
+// Diff mask in ABI field order (M7_RECF_A..VOFS lsb-first, matching the
+// daemon's SetChainField): bit0=A bit1=B bit2=C bit3=D bit4=X bit5=Y
+// bit6=HOFS bit7=VOFS.
+wire [7:0] cur_mask = {rc_v != m7vofs_out, rc_h != m7hofs_out,
+                       rc_y != m7y_out,      rc_x != m7x_out,
                        rc_d != m7d_out,      rc_c != m7c_out,
                        rc_b != m7b_out,      rc_a != m7a_out};
 
-// value byte selected by the walking mask; fields walk lsb-first through
-// mask bits 0..7 (A,B,C,D as lo,hi 16-bit pairs; X,Y,H,VOFS as lo,hi with
-// the 13-bit value right-aligned), then bit8 = M7SEL (single byte)
+// Value byte selected by the walking mask. One mask bit = one FIELD in
+// ABI order (M7_RECF_A..VOFS, lsb-first); the lowest set bit picks the
+// field, and step parity picks lo/hi. Record bytes leave one step after
+// their mux (byte k = mux at step k), so the value pairs are steps
+// (3,4),(5,6),... — an ODD step emits the lo byte, an even step the hi
+// byte, and the walk clears its bit at the end of each even step (after
+// that hi byte was registered). rec_rm bit 8 = the M7SEL tail byte of
+// the 0xFE full sync (single byte, no parity).
+// The previous LUT mapped TWO mask bits per field (bit0=a.lo, bit1=a.hi,
+// ...) with no parity selector: every payload byte doubled and x/y/hofs/
+// vofs were unreachable, so every register the daemon received was a
+// doubled-byte palindrome — the whole-record corruption fixed here.
+wire [2:0] rm_field = rec_rm[0] ? M7_RECF_A    :
+                      rec_rm[1] ? M7_RECF_B    :
+                      rec_rm[2] ? M7_RECF_C    :
+                      rec_rm[3] ? M7_RECF_D    :
+                      rec_rm[4] ? M7_RECF_X    :
+                      rec_rm[5] ? M7_RECF_Y    :
+                      rec_rm[6] ? M7_RECF_HOFS : M7_RECF_VOFS;
 reg [7:0] rm_val;
 always @(*) begin
-    casez (rec_rm)
-        9'b???????1?: rm_val = rc_a[7:0];
-        9'b??????10?: rm_val = rc_a[15:8];
-        9'b?????100?: rm_val = rc_b[7:0];
-        9'b????1000?: rm_val = rc_b[15:8];
-        9'b???10000?: rm_val = rc_c[7:0];
-        9'b??100000?: rm_val = rc_c[15:8];
-        9'b?1000000?: rm_val = rc_d[7:0];
-        9'b10000000?: rm_val = rc_d[15:8];
-        9'b000000001: rm_val = {3'b000, rc_x[7:0]};
-        9'b000000010: rm_val = {5'b00000, rc_x[12:8]};
-        9'b000000100: rm_val = {3'b000, rc_y[7:0]};
-        9'b000001000: rm_val = {5'b00000, rc_y[12:8]};
-        9'b000010000: rm_val = {3'b000, rc_h[7:0]};
-        9'b000100000: rm_val = {5'b00000, rc_h[12:8]};
-        9'b001000000: rm_val = {3'b000, rc_v[7:0]};
-        9'b010000000: rm_val = {5'b00000, rc_v[12:8]};
-        9'b100000000: rm_val = rec_sel_b;
-        default:      rm_val = 8'h00;
-    endcase
+    if (rec_rm[8] && (rec_rm[7:0] == 8'd0)) begin
+        // M7SEL tail byte of the 0xFE full sync: rec_rm seeds as 9'h1FF,
+        // so bit 8 rides along the whole walk — it only selects sel once
+        // the eight field bits have been cleared (step 19).
+        rm_val = rec_sel_b;
+    end else begin
+        case (rm_field)
+            M7_RECF_A:    rm_val = rec_step[0] ? rc_a[7:0]   : rc_a[15:8];
+            M7_RECF_B:    rm_val = rec_step[0] ? rc_b[7:0]   : rc_b[15:8];
+            M7_RECF_C:    rm_val = rec_step[0] ? rc_c[7:0]   : rc_c[15:8];
+            M7_RECF_D:    rm_val = rec_step[0] ? rc_d[7:0]   : rc_d[15:8];
+            M7_RECF_X:    rm_val = rec_step[0] ? rc_x[7:0]   : {5'b00000, rc_x[12:8]};
+            M7_RECF_Y:    rm_val = rec_step[0] ? rc_y[7:0]   : {5'b00000, rc_y[12:8]};
+            M7_RECF_HOFS: rm_val = rec_step[0] ? rc_h[7:0]   : {5'b00000, rc_h[12:8]};
+            M7_RECF_VOFS: rm_val = rec_step[0] ? rc_v[7:0]   : {5'b00000, rc_v[12:8]};
+        endcase
+    end
 end
 
 // Record payload byte at each step. Common header: [len][opcode][b2] with
