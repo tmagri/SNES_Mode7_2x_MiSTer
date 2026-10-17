@@ -99,58 +99,75 @@ inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
   // matrix step — mirroring the PPU's native HD path exactly (PPU.vhd:
   // M7_VRAM_X2 = M7_VRAM_X + M7A/2, signed divide = truncate toward zero;
   // M7A is the raw 8.8 register, so a/2 in the 256ths domain = half step).
+  // P2d-3 perf: measured 23.6 ms avg / 38 ms max per 224-row frame on the
+  // A9 (~38 fps ceiling). The per-dot mode7_product calls were the hot
+  // spot — and their real cost was the integer DIVISIONS inside
+  // truncate-toward-zero-to-64, not the multiply. The rewrite keeps an
+  // exact running raw product (pxa = a*screen_x, advanced by ±a per dot
+  // pair — screen_x steps by 1) and applies the truncation with two
+  // arithmetic shifts: mode7_product(m, k) == (m*k >> 6) << 6 for every
+  // sign combination, because truncation-to-a-multiple-of-64-toward-zero
+  // equals floor-to-64 for positive products and the assert-verified
+  // negative case (-257*1 -> -320) is floor(-257/64)*64 too. The emitted
+  // x_fixed/y_fixed sequence is bit-identical to the multiply version
+  // (validated bit-for-bit by test_mode7_renderer); floor_fixed_8(v) ==
+  // v >> 8 likewise (arithmetic shift IS floor division by 256).
+  const bool flip_x = (m7sel & 0x01) != 0;
+  // Seed = the raw product a*screen_x AT k=0 — screen_x is +255 under
+  // flip (its VALUE is positive; only the walk direction inverts) — and
+  // the per-pair increment is ±m following screen_x's step of ±1.
+  const int32_t da = regs.a * (flip_x ? -1 : 1);
+  const int32_t dc = regs.c * (flip_x ? -1 : 1);
+  const int32_t half_a = regs.a / 2;   // truncate toward zero, like the PPU
+  const int32_t half_c = regs.c / 2;
+  int32_t pxa = static_cast<int32_t>(regs.a) * (flip_x ? 255 : 0);
+  int32_t pxc = static_cast<int32_t>(regs.c) * (flip_x ? 255 : 0);
   for (int d = 0; d < static_cast<int>(M7_PIX_STRIDE); ++d) {
-    const int k = d >> 1;
-    const int screen_x = (m7sel & 0x01) ? 255 - k : k;
-
-    // Per-dot: add A*screenX (for map X) and C*screenX (for map Y).
-    const int32_t x_full = base_x + mode7_product(regs.a, screen_x);
-    const int32_t y_full = base_y + mode7_product(regs.c, screen_x);
+    const int32_t x_trunc = (pxa >> 6) << 6;
+    const int32_t y_trunc = (pxc >> 6) << 6;
     const int32_t x_fixed =
-        (d & 1) ? x_full + regs.a / 2 : x_full;
+        (d & 1) ? base_x + x_trunc + half_a : base_x + x_trunc;
     const int32_t y_fixed =
-        (d & 1) ? y_full + regs.c / 2 : y_full;
+        (d & 1) ? base_y + y_trunc + half_c : base_y + y_trunc;
 
+    uint8_t px = 0;
     const bool outside = !coordinate_inside_map(x_fixed) ||
                          !coordinate_inside_map(y_fixed);
-
     // M7SEL overflow modes:
     //   00, 01: wrap (mask address to 1024x1024 — handled by & 0x3FF below)
     //   10:     transparent outside the map
     //   11:     substitute tile 0 outside the map
-    if (outside && overflow == 2) {
-      out[d] = 0;  // transparent
-      continue;
+    if (!outside || overflow != 2) {
+      const unsigned map_x = static_cast<unsigned>(x_fixed >> 8) & 0x3FF;
+      const unsigned map_y = static_cast<unsigned>(y_fixed >> 8) & 0x3FF;
+      const unsigned tile_row = map_y & 7;   // pixel row within tile (0-7)
+      const unsigned tile_col = map_x & 7;   // pixel column within tile (0-7)
+
+      // Tilemap: fixed at flat byte 0x4000 in Mode 7, 128 tiles per row,
+      // 128 rows = 16384 one-byte entries.
+      const unsigned map_addr = (map_y >> 3) * 128 + (map_x >> 3);
+
+      // M7SEL=11 substitutes tile zero outside the 1024x1024 map.
+      // Tilemap: 128x128 one-byte entries, plane 1 at word = map_addr.
+      const unsigned tile =
+          (outside && overflow == 3) ? 0 : vram1[map_addr];
+
+      // Character data: plane 2, word = tile*64 + row*8 + col.
+      const unsigned char_addr = tile * 64 + tile_row * 8 + tile_col;
+      const uint8_t pixel = vram2[char_addr];
+
+      // EXTBG mode: bit 7 is the BG2 priority flag, bits 6:0 are the
+      // color index (into CGRAM entries 0-127). For BG1 (no EXTBG bit set),
+      // all 8 bits are the color index. The daemon outputs one merged
+      // layer for the FPGA CLUT, so in EXTBG mode we strip the priority
+      // bit and output just the 7-bit color index. Color index 0 remains
+      // transparent regardless.
+      px = extbg ? static_cast<uint8_t>(pixel & 0x7F) : pixel;
     }
-
-    const unsigned map_x = static_cast<unsigned>(floor_fixed_8(x_fixed)) & 0x3FF;
-    const unsigned map_y = static_cast<unsigned>(floor_fixed_8(y_fixed)) & 0x3FF;
-    const unsigned tile_row = map_y & 7;   // pixel row within tile (0-7)
-    const unsigned tile_col = map_x & 7;   // pixel column within tile (0-7)
-
-    // Tilemap: fixed at flat byte 0x4000 in Mode 7, 128 tiles per row,
-    // 128 rows = 16384 one-byte entries.
-    const unsigned map_addr = (map_y >> 3) * 128 + (map_x >> 3);
-
-    // M7SEL=11 substitutes tile zero outside the 1024x1024 map.
-    // Tilemap: 128x128 one-byte entries, plane 1 at word = map_addr.
-    const unsigned tile =
-        (outside && overflow == 3) ? 0 : vram1[map_addr];
-
-    // Character data: plane 2, word = tile*64 + row*8 + col.
-    const unsigned char_addr = tile * 64 + tile_row * 8 + tile_col;
-    const uint8_t pixel = vram2[char_addr];
-
-    // EXTBG mode: bit 7 is the BG2 priority flag, bits 6:0 are the
-    // color index (into CGRAM entries 0-127). For BG1 (no EXTBG bit set),
-    // all 8 bits are the color index. The daemon outputs one merged
-    // layer for the FPGA CLUT, so in EXTBG mode we strip the priority
-    // bit and output just the 7-bit color index. Color index 0 remains
-    // transparent regardless.
-    if (extbg) {
-      out[d] = pixel & 0x7F;  // strip priority bit, 0 stays transparent
-    } else {
-      out[d] = pixel;  // full 8-bit index, 0 = transparent
+    out[d] = px;
+    if (d & 1) {
+      pxa += da;
+      pxc += dc;
     }
   }
 }
