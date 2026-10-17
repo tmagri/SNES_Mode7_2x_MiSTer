@@ -10,7 +10,9 @@
 #include "m7_uart_parser.h"
 
 #include <cstdint>
+#include <csignal>
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -44,6 +46,12 @@
 // ===========================================================================
 
 namespace {
+
+// SIGUSR1 debug: write the last-published pixbuf + renderer state to /tmp.
+// The handler only sets a flag; the main loop does the (unsafe-in-a-handler)
+// file work between polls.
+volatile sig_atomic_t g_dbg_dump = 0;
+void OnUsr1(int) { g_dbg_dump = 1; }
 
 const char *kDevMem = "/dev/mem";
 // Optional kernel module (kernel/m7_mem_wc) exposing a write-combined
@@ -192,14 +200,20 @@ class M7Daemon {
     uint32_t last_syncs = 0;
     bool published_frame = false;
 
+    signal(SIGUSR1, OnUsr1);
+
     while (true) {
       PumpStream();
+      if (g_dbg_dump) {
+        g_dbg_dump = 0;
+        WriteDebugDump();
+      }
 
       // The full-sync record follows the line records at vblank. Do not
       // render until the initial VRAM snapshot is complete as well.
       if (syncs_ != last_syncs) {
         last_syncs = syncs_;
-        if (completed_frame_ready_ && vram_valid_ &&
+        if (completed_frame_ready_ && vram_valid_ && tel_mode_ == 7 &&
             (!static_card_ || !published_frame)) {
           cur_pub_ ^= 1u;
           RenderFrame(cur_pub_);
@@ -223,7 +237,7 @@ class M7Daemon {
       // completions still land promptly).
       if (!dump_requested_ && !dump_req_pending_ && vram_valid_ &&
           now - last_render_ns_ < 2000000000ull &&
-          now - last_resync_ns_ >= kResyncIntervalNs) {
+          now - last_resync_ns_ >= ResyncInterval()) {
         last_resync_ns_   = now;
         dump_req_pending_ = true;
       }
@@ -255,6 +269,7 @@ class M7Daemon {
                   << parser_.crc_bad() << " crc_bad | syncs=" << syncs_
                   << " lines=" << rec_lines_ << " sel=0x"
                   << std::hex << static_cast<int>(m7sel_) << std::dec
+                  << " mode=" << static_cast<int>(tel_mode_)
                   << " drops=" << static_cast<int>(tel_drops_)
                   << " wtdrop=" << tel_wt_drops_ << " dumps=" << dumps_done_
                   << " fb=" << static_cast<int>(fb_seq_seen_)
@@ -275,10 +290,12 @@ class M7Daemon {
                   << " fr=" << (drt_frames_ ? (drt_acc_ / 32) / drt_frames_
                                             : 0) << "r/f"
                   << " wt=" << wt_recs_last_ << "r/" << wt_bytes_last_ << "B"
+                  << " wts=" << wtdrop_acc_
                   << (dump_requested_ ? " dumpWAIT" : "")
                   << (dump_req_pending_ ? " dumpREQ" : "") << std::endl;
         drt_acc_    = 0;
         drt_frames_ = 0;
+        wtdrop_acc_ = 0;
         log_mark = frames_valid_;
       }
       sleep_ns(2000000ull);  // 2 ms poll; syncs arrive at 60 Hz
@@ -388,6 +405,29 @@ class M7Daemon {
           drt_sync_mark_ = syncs_;
           tel_ppuy_ = le16(fr.payload + 58);  // scanline at sample instant
           tel_ars_  = le16(fr.payload + 60);  // FPGA's last adopted ready_seq
+          // PPU BGMODE ($2105 low bits) at the sample instant (build-8+
+          // bitstreams; 0xAA filler on older ones — keep 7 then, so the
+          // publish gate below never stalls on a bitstream without it).
+          if (fr.len >= 153 && fr.payload[152] != 0xAA) {
+            // Adopt only after two consecutive telemetry frames agree on a
+            // non-0xAA byte. The parser boots blind mid-record: one record
+            // frame whose data byte 0xC3 lands at payload[0] classifies as
+            // telemetry (carry_len_==0), and its arbitrary byte 152 would
+            // poison tel_mode_ — which the 0xAA guard below then preserves
+            // forever (true telemetry carries 0xAA and never updates it).
+            // Real BGMODE repeats on every telemetry frame; boot garbage
+            // happens once.
+            if (fr.payload[152] == prev_mode_raw_)
+              ++mode_agree_;
+            else
+              mode_agree_ = 0;
+            prev_mode_raw_ = fr.payload[152];
+            if (mode_agree_ >= 1) tel_mode_ = fr.payload[152] & 7;
+            // Raw evidence for the byte-152 gate: capture neighbors so a
+            // misaligned or bleeding export is visible in the debug dump.
+            last_tel_len_ = fr.len;
+            memcpy(tel_150_, fr.payload + 150, 6);
+          }
         }
         // FPGA dump-machinery window (bytes 140-147, P2c-3 diag block):
         // dm = fetch/dump FSM state, rd = dump read pointer, bc = bytes
@@ -402,6 +442,14 @@ class M7Daemon {
           tel_bw_   = le16(fr.payload + 144);
           tel_rcnt_ = le16(fr.payload + 146);
         }
+        // NOTE (2026-10-17): a "fire the resync dump NOW on the mode->7
+        // transition" trigger was tried here and REVERTED. SMK's attract
+        // flaps BGMODE 0/1/7 constantly; the trigger fired 75 dumps in
+        // ~7 min, and at the yield-capped chunk rate a dump owns the
+        // record channel for ~4-8 s — valid frames collapsed 1100->237/s,
+        // cov to 0/224, and the per-line M7 matrix records starved (the
+        // render ran on a=0 b=0 c=0 d=257 = vertical-band speckle). The
+        // paced 2.5 s event-driven resync stays the only dump scheduler.
         // P2c-5 line-retry counters (bytes 148-151): stash overwrites (real
         // losses, 16-bit — the legacy [131] byte wraps within one frame
         // under wt bursts) and retry pushes delivered.
@@ -499,6 +547,16 @@ class M7Daemon {
             // stay cosmetic (stale tiles until the next dump); dumps are
             // requested on boot, crc_bad, and the FB-loss watchdog only.
             tel_wt_drops_ = le16(fr.payload + 138);
+            // Streaming-intensity signal: accumulate wrap-safe deltas of the
+            // wt drop counter (torn reads jump >20k in one sample — skip
+            // those). Heavy streaming (SMK racing streams map tiles
+            // continuously) accelerates the paced VRAM resync below.
+            if (tel_wt_drops_ != wtdrop_prev_) {
+              const uint16_t d =
+                  static_cast<uint16_t>(tel_wt_drops_ - wtdrop_prev_);
+              if (d < 20000u) wtdrop_acc_ += d;
+              wtdrop_prev_ = tel_wt_drops_;
+            }
           }
         }
       } else {
@@ -763,6 +821,66 @@ class M7Daemon {
     CacheFlush(buf, static_cast<size_t>(M7_LINE_COUNT) * M7_PIX_STRIDE);
   }
 
+  // SIGUSR1 debug capture: raw CLUT-index PGM of the last-published buffer,
+  // plus a text sidecar (per-line reg shadow + VRAM health stats) — enough
+  // to tell a stale-VRAM render from a stale-register one without guessing
+  // at colors the FPGA's CGRAM adds at display time.
+  void WriteDebugDump() {
+    const int w = static_cast<int>(M7_PIX_STRIDE);
+    const int h = static_cast<int>(M7_LINE_COUNT);
+    {
+      std::ofstream p("/tmp/m7_dbg.pgm", std::ios::binary);
+      p << "P5\n" << w << " " << h << "\n255\n";
+      p.write(const_cast<const char *>(
+                  reinterpret_cast<const volatile char *>(pix_[cur_pub_])),
+              static_cast<std::streamsize>(w) * h);
+    }
+    {
+      std::ofstream t("/tmp/m7_dbg.txt");
+      int ok = 0;
+      for (int y = 0; y < h; ++y)
+        if (completed_line_ok_[y]) ++ok;
+      t << "cur_pub=" << cur_pub_ << " completed_ok=" << ok << "/" << h
+        << " m7sel=0x" << std::hex << static_cast<int>(completed_m7sel_)
+        << std::dec << " mode=" << static_cast<int>(tel_mode_)
+        << " tel_len=" << last_tel_len_ << " tel[150..155]=" << std::hex
+        << static_cast<int>(tel_150_[0]) << " "
+        << static_cast<int>(tel_150_[1]) << " "
+        << static_cast<int>(tel_150_[2]) << " "
+        << static_cast<int>(tel_150_[3]) << " "
+        << static_cast<int>(tel_150_[4]) << " "
+        << static_cast<int>(tel_150_[5]) << std::dec
+        << " extbg=" << extbg_ << " vram_valid=" << vram_valid_ << "\n";
+      for (int y = 0; y < h; y += 16) {
+        const M7Regs &r = completed_shadow_[y];
+        t << "y=" << y << (completed_line_ok_[y] ? " ok  " : " BAD ")
+          << " a=" << r.a << " b=" << r.b << " c=" << r.c << " d=" << r.d
+          << " cx=" << r.x << " cy=" << r.y << " hofs=" << r.hofs
+          << " vofs=" << r.vofs << "\n";
+      }
+      // Tilemap health: the Mode 7 map is flat bytes 0x4000..0x7FFF. A live
+      // SMK map has hundreds of distinct tile indices; a stale/zeroed image
+      // collapses to one or two values — that split decides the diagnosis.
+      uint32_t hist[256] = {};
+      for (unsigned i = 0; i < 16384u; ++i)
+        ++hist[m7::vram7_byte(loc_v1_, loc_v2_, 0x4000u + i)];
+      unsigned distinct = 0, nonzero = 0;
+      for (int v = 1; v < 256; ++v)
+        if (hist[v]) {
+          ++distinct;
+          nonzero += hist[v];
+        }
+      t << "tilemap: distinct=" << distinct << " nonzero=" << nonzero
+        << "/16384 tile0=" << hist[0] << "\ntileset[0..15]:";
+      for (unsigned i = 0; i < 16; ++i)
+        t << " " << std::hex
+          << static_cast<int>(m7::vram7_byte(loc_v1_, loc_v2_, i)) << std::dec;
+      t << "\n";
+    }
+    std::cout << "debug dump written to /tmp/m7_dbg.pgm + /tmp/m7_dbg.txt"
+              << std::endl;
+  }
+
   bool WaitFrameSeqChange(uint32_t timeout_ms) {
     const uint16_t start = hdr_[M7_HDR_FRAME_SEQ];
     const uint64_t deadline = now_ns() + static_cast<uint64_t>(timeout_ms) * 1000000ull;
@@ -824,6 +942,18 @@ class M7Daemon {
   // interval keeps the daemon's VRAM image within ~one dump of live even
   // for games that stream tiles continuously.
   static const uint64_t kResyncIntervalNs = 5000000000ull;
+  static const uint32_t kHeavyStreamWt = 12000;  // wt drops/window that halves
+                                                 // the resync interval
+
+  // Paced resync interval: 5 s normally, 2.5 s while VRAM streaming is
+  // heavy (the wt channel physically cannot keep up with games that
+  // stream map tiles every frame — racing on SMK sheds ~2-3k drops/s).
+  uint64_t ResyncInterval() const {
+    return wtdrop_acc_ > kHeavyStreamWt ? kResyncIntervalNs / 2
+                                        : kResyncIntervalNs;
+  }
+  uint32_t wtdrop_acc_  = 0;  // wt drops this status window
+  uint16_t wtdrop_prev_ = 0;  // last cumulative wt-drops sample
   uint64_t last_render_ns_ = 0;
   uint64_t last_resync_ns_ = 0;
   // Re-request backstop. Since the P2c-4 yield cap a dump consumes only the
@@ -863,6 +993,12 @@ class M7Daemon {
   uint16_t tel_hde_       = 0;   // hde falls last frame (edge-detector check)
   uint16_t tel_ppuy_      = 0;   // ppu_y at the telemetry sample instant
   uint16_t tel_ars_       = 0;   // FPGA last_ready_seq at the sample instant
+  uint8_t  tel_mode_      = 7;   // PPU BGMODE low bits (0xAA filler => keep 7)
+  uint8_t  prev_tel_mode_ = 7;   // previous sample, for the ->7 transition dump
+  uint8_t  prev_mode_raw_ = 0xAA;  // last frame's raw byte 152 (agree check)
+  uint8_t  mode_agree_    = 0;     // consecutive agreeing frames
+  uint16_t last_tel_len_  = 0;   // debug: len of the last mode-updating frame
+  uint8_t  tel_150_[6]    = {};  // debug: raw payload[150..155] of that frame
 
   // Compact hex of a byte range for the status line (no separators).
   static std::string RowsHex(const uint8_t *b, int from, int to) {

@@ -2722,7 +2722,13 @@ always @(posedge clk_sys) begin
                     // can never straddle one mid-row — and rate-limits the
                     // sweep to the display pace. Safety counter un-wedges
                     // a park with no hde falls (video gone).
-                    dm_state <= DM_ROW_END;
+                    // Row 0 skips the park (P2c-7): right after the adoption
+                    // restart it must run straight into row 1 so the vblank
+                    // pre-fetches BOTH rows the arm gate needs at the first
+                    // visible hde fall (row_done[1]). Without this the gated
+                    // park never releases during vblank and every line falls
+                    // back native, one row behind the arm gate forever.
+                    dm_state <= (fetch_row == 9'd0) ? DM_IDLE : DM_ROW_END;
                 end else begin
                     fetch_word <= fetch_word + 8'd1;
                     dm_state <= DM_IDLE;
@@ -2797,7 +2803,14 @@ always @(posedge clk_sys) begin
         arm_cnt <= 16'd0;
     end else if (~HBlank_out & hde_d) begin
         hde_cnt <= hde_cnt + 16'd1;
-        row_adv <= (dm_state == DM_ROW_END);
+        // Vblank gate (P2c-7 alignment fix): the park must NOT release on
+        // vblank hde falls. The NTSC vblank is ~38 lines; letting the writer
+        // run there laps it ~36-38 rows ahead of scanout and the whole frame
+        // displays row L+36 at line L (measured: dr=187 at py=151). With the
+        // gate the writer holds at most the park's one-row lead and line L
+        // shows row L. The park's own safety counter (park_cnt full ≈ 1.5ms)
+        // still un-wedges a park longer than vblank if video dies.
+        row_adv <= (dm_state == DM_ROW_END) && ~vblank_out;
         if (m7_fetch_en && (ppu_y < 9'd223)) begin
             if (row_done[ppu_y + 9'd1]) begin
                 arm_cnt <= arm_cnt + 16'd1;
