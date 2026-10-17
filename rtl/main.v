@@ -120,6 +120,7 @@ module main (
 	output     [12:0] M7HOFS_OUT,
 	output     [12:0] M7VOFS_OUT,
 	output     [7:0]  M7SEL_OUT,
+	output     [2:0]  BGMODE_OUT,		// $2105 low bits — real Mode 7 indicator (see PPU.vhd)
 
 	// True vblank level from the PPU (VBLANKn is delayed/gated elsewhere).
 	// The M7 frame controller uses its rising edge as the frame boundary.
@@ -330,6 +331,7 @@ SNES SNES
 	.m7hofs_out(M7HOFS_OUT),
 	.m7vofs_out(M7VOFS_OUT),
 	.m7sel_out(M7SEL_OUT),
+	.bgmode_out(BGMODE_OUT),
 
 	// Phase 1: HD pixel mux inputs (tied off; Phase 2 will drive these from the line buffer)
 	.hd_pixel_in(HD_PIXEL_IN),

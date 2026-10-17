@@ -630,6 +630,7 @@ reg [15:0] main_audio_r;
 wire [15:0] m7a_out, m7b_out, m7c_out, m7d_out;
 wire [12:0] m7x_out, m7y_out, m7hofs_out, m7vofs_out;
 wire [7:0]  m7sel_out;
+wire [2:0]  bgmode_out;
 
 // Phase 2 Task 2.1: HD Mode 7 Line Buffer wires
 wire [8:0]  x_out;
@@ -836,6 +837,7 @@ main main
 	.M7HOFS_OUT(m7hofs_out),
 	.M7VOFS_OUT(m7vofs_out),
 	.M7SEL_OUT(m7sel_out),
+	.BGMODE_OUT(bgmode_out),
 
 	// HD pixel ports are unused inside the PPU now (the overlay moved to
 	// sys_top); the inputs stay tied off for port compatibility.
@@ -2811,7 +2813,15 @@ always @(posedge clk_sys) begin
         // shows row L. The park's own safety counter (park_cnt full ≈ 1.5ms)
         // still un-wedges a park longer than vblank if video dies.
         row_adv <= (dm_state == DM_ROW_END) && ~vblank_out;
-        if (m7_fetch_en && (ppu_y < 9'd223)) begin
+        // BGMODE gate (P2c-8): adopt/park only while $2105 says the screen is
+        // a real Mode 7 frame. M7SEL is NOT a mode indicator (it holds 0x8 /
+        // 0x9 / 0xff across mode changes), so on non-Mode-7 screens (race
+        // finish, points tally) the writer kept filling rows from the stale
+        // race pixbuf and the HD layer showed it through the NEW screen's
+        // CGRAM palette = solid horizontal stripes. Gating here freezes
+        // adoption (m7_line_hd falls -> native fallback) AND arm_cnt, while
+        // the daemon's tel_mode_ publish gate stops the writes at the source.
+        if (m7_fetch_en && (ppu_y < 9'd223) && (bgmode_out == 3'd7)) begin
             if (row_done[ppu_y + 9'd1]) begin
                 arm_cnt <= arm_cnt + 16'd1;
                 if (last_row_id != disp_row) begin
@@ -2923,7 +2933,8 @@ assign dbg_bytes[1215:1208] = rec_retries[15:8];      // [151] retry pushes (h)
 assign dbg_bytes[503:496] = {6'b0, dbg_ddr_state};    // [62] ddram FSM state
 assign dbg_bytes[511:504] = 8'h5A;                    // [63] tail magic
 assign dbg_bytes[1023:512] = 64'd0;                   // [64..127] undefined
-assign dbg_bytes[2047:1216] = {104{32'hAAAA_AAAA}};   // filler (bytes 152..255)
+assign dbg_bytes[1223:1216] = {5'b0, bgmode_out};     // [152] $2105 BGMODE low bits (0xAA filler on pre-build-8 bitstreams)
+assign dbg_bytes[2047:1224] = {103{32'hAAAA_AAAA}};   // filler (bytes 153..255)
 
 wire m7_stream_txd;
 m7_reg_stream #(

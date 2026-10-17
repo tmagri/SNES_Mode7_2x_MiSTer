@@ -428,3 +428,48 @@ The 5 s status line now carries `cov=` (per-frame delivered line-record
 count /224, max gap) decoded from the record stream itself, and
 `wt=` (write-through records/bytes received per frame) — the numbers
 that turned every remaining ambiguity above into decodable data.
+
+# REVISION v7 — BGMODE telemetry byte + event-driven resync (2026-10-17, P2c-7/8)
+
+## Telemetry byte 152 = PPU BGMODE (RTL, build-8 bitstreams)
+
+`PPU.vhd` exports `$2105` low bits as `BGMODE_OUT[2:0]` (threaded through
+`rtl/SNES.vhd` and `rtl/main.v`); the top level places it at telemetry
+payload byte 152 (`{5'b0, bgmode_out}`). On older bitstreams byte 152 is
+`0xAA` filler — the daemon keeps its default (`7`) whenever it sees
+`0xAA`, so the publish gate never stalls a bitstream without the field.
+
+Why: `M7SEL` is NOT a mode indicator (it holds 0x8/0x9/0xff across mode
+changes). Consumers:
+
+- **Daemon publish gate**: render/publish only while `tel_mode_ == 7` —
+  stops 57 KB/frame pixel-buffer writes (port contention with the fetch
+  sweep) and stops the stale-pixbuf-through-new-palette artifact on
+  non-Mode-7 screens (race finish / points tally).
+- **RTL arm gate** (build-8): the display-path adoption/park additionally
+  requires `bgmode_out == 3'd7`, so the HD layer falls back to native
+  rendering the moment the PPU leaves Mode 7 even if the daemon has not
+  caught up.
+
+**Adoption rule (daemon)**: a non-0xAA byte 152 is accepted only after
+TWO consecutive telemetry frames agree (the parser boots blind
+mid-record; one misclassified record frame must not poison the gate —
+the 0xAA guard would otherwise preserve the poison forever).
+
+## Event-driven resync cadence (daemon)
+
+The 5 s paced VRAM resync halves to **2.5 s while the write-through
+channel is drowning** (`wt` drop deltas > 12 000 per status window,
+accumulated with a <20 000 clamp against torn reads). SMK streams ~10 k
+VRAM writes/s past a ~150 B/s capture budget; the accelerated pace keeps
+the daemon's VRAM image within a few frames of the PPU during racing at
+the cost of ~half the fetch sweep speed during dump phases (accepted
+trade — alignment lockstep holds, `dr = py+1`).
+
+## Debug interface (daemon, not on the wire)
+
+`SIGUSR1` → `/tmp/m7_dbg.pgm` (raw CLUT-index PGM of the last-published
+buffer, 256×224) + `/tmp/m7_dbg.txt` (per-line reg shadow, `m7sel`,
+tilemap distinct/nonzero histogram, tileset bytes). Proven
+2026-10-17: the title-screen "stripes" decoded as the CORRECT render of
+SMK's zoomed-out title map (a=b=−23645 ⇒ scale ≈ 0.011, wrap fill).

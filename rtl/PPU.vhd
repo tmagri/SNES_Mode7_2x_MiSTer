@@ -79,6 +79,10 @@ entity SPPU is
 		M7HOFS_OUT		: out std_logic_vector(12 downto 0);
 		M7VOFS_OUT		: out std_logic_vector(12 downto 0);
 		M7SEL_OUT		: out std_logic_vector(7 downto 0);
+		BGMODE_OUT		: out std_logic_vector(2 downto 0);	-- $2105 low bits: BGMODE_OUT==7 tells the
+																-- HD pipeline the screen is a real Mode 7
+																-- frame (sel is NOT a mode indicator; it
+																-- holds 0x8/0x9/0xff across mode changes)
 
 		-- Phase 1 Task 1.2: HD pixel mux inputs (ARM-generated high-res scanline pixels)
 		HD_PIXEL_IN		: in std_logic_vector(23 downto 0);	-- 24-bit RGB from ARM
@@ -2802,6 +2806,7 @@ M7Y_OUT    <= M7Y;
 M7HOFS_OUT <= M7HOFS;
 M7VOFS_OUT <= M7VOFS;
 M7SEL_OUT  <= M7SEL;
+BGMODE_OUT <= BG_MODE;
 
 HIGH_RES <= HIRES or (PSEUDOHIRES and not BLEND)
 				or (M7_HD and not HIRES and not PSEUDOHIRES
