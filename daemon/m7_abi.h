@@ -21,14 +21,14 @@
 #define M7_CGRAM_BASE    0x3E120000u  // CGRAM image, 256x2 B (FPGA->ARM)
 
 #define M7_PIXBUF_BYTES  0x00070000u  // buffer slot (224*256 B used, 8bpp)
-#define M7_PIX_STRIDE    256u         // native pixels per row (8bpp = bytes)
+#define M7_PIX_STRIDE    512u         // HD dots per row (8bpp = bytes, 2x)
 
 // --- Header / protocol identity ---
 #define M7_MAGIC0       0x4D37u  // 'M7'
 #define M7_MAGIC1       0x4231u  // 'B1'
 #define M7_ABI_VERSION  1u
 #define M7_LINE_COUNT   224u     // visible scanlines
-#define M7_HD_SCALE     4u       // HD scale fixed at 4x
+#define M7_HD_SCALE     2u       // HD strobes per native pixel (2x)
 
 // --- Header layout: 16-bit word index at M7_MAILBOX_BASE ---
 #define M7_HDR_MAGIC0      0

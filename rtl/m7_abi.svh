@@ -27,15 +27,15 @@ localparam [31:0] M7_VRAM1_BASE    = 32'h3E100000;  // VRAM plane 1 image, 64 Ki
 localparam [31:0] M7_VRAM2_BASE    = 32'h3E110000;  // VRAM plane 2 image, 64 KiB (FPGA->ARM)
 localparam [31:0] M7_CGRAM_BASE    = 32'h3E120000;  // CGRAM image, 256x2 B (FPGA->ARM)
 
-localparam [31:0] M7_PIXBUF_BYTES  = 32'h00070000;  // buffer slot (224*256 B used, 8bpp)
-localparam [8:0]  M7_PIX_STRIDE    = 9'd256;        // native pixels per row (8bpp = bytes)
+localparam [31:0] M7_PIXBUF_BYTES  = 32'h00070000;  // buffer slot (224*512 B used, 8bpp)
+localparam [8:0]  M7_PIX_STRIDE    = 9'd512;        // HD dots per row (8bpp = bytes, 2x)
 
 // --- Header / protocol identity ---
 localparam [15:0] M7_MAGIC0       = 16'h4D37;  // 'M7'
 localparam [15:0] M7_MAGIC1       = 16'h4231;  // 'B1'
 localparam [15:0] M7_ABI_VERSION  = 16'd1;
 localparam [15:0] M7_LINE_COUNT   = 16'd224;   // visible scanlines
-localparam [3:0]  M7_HD_SCALE     = 4'd4;      // HD scale fixed at 4x
+localparam [3:0]  M7_HD_SCALE     = 4'd2;      // HD strobes per native pixel (2x)
 
 // --- Header layout: 16-bit word index at M7_MAILBOX_BASE ---
 localparam [4:0] M7_HDR_MAGIC0      = 0;  // = M7_MAGIC0

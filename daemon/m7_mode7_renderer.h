@@ -69,6 +69,10 @@ inline bool coordinate_inside_map(int32_t fixed) {
 // vram1[] / vram2[] are the two byte planes, word-indexed (32768 words
 // each): vram1[w] = word w's low byte, vram2[w] = word w's high byte.
 // --------------------------------------------------------------------------
+// Renders one scanline at HD 2x: M7_PIX_STRIDE output dots per line (512,
+// two per native lores pixel), each offset half a matrix step from the
+// previous — the same sampling the PPU's native HD path performs (see the
+// loop comment below). out[] is indexed by dot.
 inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
                        bool extbg, const uint8_t *vram1,
                        const uint8_t *vram2, uint8_t *out) {
@@ -90,12 +94,22 @@ inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
     mode7_product(regs.c, origin_x) + mode7_product(regs.d, origin_y) +
     mode7_product(regs.d, screen_y);
 
-  for (int x = 0; x < static_cast<int>(M7_PIX_STRIDE); ++x) {
-    const int screen_x = (m7sel & 0x01) ? 255 - x : x;
+  // HD 2x: each lores pixel k expands to two output dots. Even dot 2k
+  // samples the lores coordinate; odd dot 2k+1 samples it offset by half a
+  // matrix step — mirroring the PPU's native HD path exactly (PPU.vhd:
+  // M7_VRAM_X2 = M7_VRAM_X + M7A/2, signed divide = truncate toward zero;
+  // M7A is the raw 8.8 register, so a/2 in the 256ths domain = half step).
+  for (int d = 0; d < static_cast<int>(M7_PIX_STRIDE); ++d) {
+    const int k = d >> 1;
+    const int screen_x = (m7sel & 0x01) ? 255 - k : k;
 
-    // Per-pixel: add A*screenX (for map X) and C*screenX (for map Y).
-    const int32_t x_fixed = base_x + mode7_product(regs.a, screen_x);
-    const int32_t y_fixed = base_y + mode7_product(regs.c, screen_x);
+    // Per-dot: add A*screenX (for map X) and C*screenX (for map Y).
+    const int32_t x_full = base_x + mode7_product(regs.a, screen_x);
+    const int32_t y_full = base_y + mode7_product(regs.c, screen_x);
+    const int32_t x_fixed =
+        (d & 1) ? x_full + regs.a / 2 : x_full;
+    const int32_t y_fixed =
+        (d & 1) ? y_full + regs.c / 2 : y_full;
 
     const bool outside = !coordinate_inside_map(x_fixed) ||
                          !coordinate_inside_map(y_fixed);
@@ -105,7 +119,7 @@ inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
     //   10:     transparent outside the map
     //   11:     substitute tile 0 outside the map
     if (outside && overflow == 2) {
-      out[x] = 0;  // transparent
+      out[d] = 0;  // transparent
       continue;
     }
 
@@ -134,9 +148,9 @@ inline void render_line(const M7Regs &regs, int line, uint8_t m7sel,
     // bit and output just the 7-bit color index. Color index 0 remains
     // transparent regardless.
     if (extbg) {
-      out[x] = pixel & 0x7F;  // strip priority bit, 0 stays transparent
+      out[d] = pixel & 0x7F;  // strip priority bit, 0 stays transparent
     } else {
-      out[x] = pixel;  // full 8-bit index, 0 = transparent
+      out[d] = pixel;  // full 8-bit index, 0 = transparent
     }
   }
 }

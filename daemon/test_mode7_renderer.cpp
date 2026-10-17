@@ -49,14 +49,18 @@ int main() {
   assert(m7::mode7_product(257, 1) == 256);
   assert(m7::mode7_product(-257, 1) == -320);
 
-  // Basic pixel fetch: identity transform, pixels at (0,0) and (1,0)
+  // Basic pixel fetch: identity transform (A=D=1.0), pixels at (0,0) and
+  // (1,0). With HD 2x each lores pixel k produces dots 2k (full step) and
+  // 2k+1 (half step): dot 1 samples map x=0.5, which floors to pixel 0.
   clear_vram();
   set_pixel(0, 0, 1, 0x31);
   set_pixel(1, 0, 1, 0x32);
   M7Regs regs = identity_regs();
   m7::render_line(regs, 0, 0, false, vram1, vram2, line);
-  assert(line[0] == 0x31);  // pixel at (0,0)
-  assert(line[1] == 0x32);  // pixel at (1,0)
+  assert(line[0] == 0x31);  // dot 0: pixel at (0,0)
+  assert(line[1] == 0x31);  // dot 1: half step, floor(0.5) = pixel (0,0)
+  assert(line[2] == 0x32);  // dot 2: pixel at (1,0)
+  assert(line[3] == 0x32);  // dot 3: half step, floor(1.5) = pixel (1,0)
 
   // Color index zero is transparent
   set_pixel(0, 0, 1, 0);

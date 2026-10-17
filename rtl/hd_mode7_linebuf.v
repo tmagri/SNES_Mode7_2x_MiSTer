@@ -27,7 +27,7 @@
 //    · rd_slot crosses 2FF; it only changes at hde falls, long before
 //      the first strobe of the next line.
 //    · Read pointer advances ONLY on px_strobe (consumption-indexed);
-//      the native index is rd_x[9:2] at the fixed 4x scale.
+//      the slot index is rd_x directly (one HD dot per strobe, 2x).
 //    · Two-stage pipeline: slot RAM -> CLUT -> RGB888 expansion, with
 //      hd_px_valid delayed to the stage where hd_pixel_out is stable.
 //      sys_top's overlay mux samples on valid, so the constant extra
@@ -47,7 +47,7 @@ module hd_mode7_linebuf
     input             clk_vid,        // Video read domain
 
     // --- Port A: DMA write interface (clk_mem) ---
-    input      [7:0]  buf_wr_addr,    // native pixel index within the row (0..255)
+    input      [8:0]  buf_wr_addr,    // HD dot index within the row (0..511)
     input      [7:0]  buf_wr_data,    // CLUT index byte
     input             buf_wr_slot,    // slot being written (stable per row)
     input             buf_wr_en,
@@ -72,7 +72,7 @@ module hd_mode7_linebuf
     output reg         hd_px_valid
 );
 
-    reg [7:0]  slotram [0:1][0:255];  // two row slots, one CLUT index/px
+    reg [7:0]  slotram [0:1][0:511];  // two row slots, one CLUT index/HD dot
     reg [14:0] clut    [0:255];       // BGR555 palette (PPU CGRAM shadow image)
 
     // ---------------------------------------------------------------------
@@ -126,8 +126,10 @@ module hd_mode7_linebuf
 
     // ---------------------------------------------------------------------
     // Arming + consumption-indexed read pointer (clk_vid)
-    // rd_x counts HD strobes (0..1023 at 4x); the native slot index is
-    // rd_x[9:2]. The pointer resets at the hde fall ending the line.
+    // rd_x counts HD strobes — one per HD dot, 512 per line at 2x (two
+    // strobes of the four CLK_VIDEO cycles each native lores pixel spans).
+    // The slot index is rd_x[8:0]. The pointer resets at the hde fall
+    // ending the line.
     // ---------------------------------------------------------------------
     reg        armed = 1'b0;
     reg [9:0]  rd_x   = 10'd0;
@@ -154,7 +156,7 @@ module hd_mode7_linebuf
     reg [14:0] rd_rgb;
 
     always @(posedge clk_vid) begin
-        rd_idx      <= slotram[rd_slot_s2][rd_x[9:2]];
+        rd_idx      <= slotram[rd_slot_s2][rd_x[8:0]];
         rd_rgb      <= clut[rd_idx];
         hd_pixel_opaque <= (rd_idx != 8'd0);
         v1          <= px_strobe & armed;
