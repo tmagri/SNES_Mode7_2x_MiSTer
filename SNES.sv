@@ -649,8 +649,9 @@ wire [14:0] dump_addr;
 `endif
 
 `ifdef M7_2X_ENABLE
-// HD scale is fixed at 4x (hd_mode7_linebuf timing + daemon pixel buffer
-// layout are validated at this rate; see rtl/m7_abi.svh).
+// HD scale is 2x (512 dots per row; hd_mode7_linebuf slot depth + daemon
+// M7_PIX_STRIDE + sys_top's strobe cadence all key off this; see
+// rtl/m7_abi.svh).
 localparam [3:0] m7_scale_wire = M7_HD_SCALE;
 
 assign M7_SCALE       = m7_scale_wire;

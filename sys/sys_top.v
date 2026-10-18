@@ -1382,7 +1382,6 @@ wire        vga_de_sl, vga_ce_sl, vga_vs_sl, vga_hs_sl;
 // -------------------------------------------------------------------------
 wire [23:0] snes_rgb_out = de_emu ? {r_out, g_out, b_out} : 24'd0;
 
-reg [3:0]  scale_cnt = 0;
 reg [23:0] final_rgb_out;
 reg        final_ce_pixel;
 
@@ -1392,40 +1391,42 @@ wire [23:0] hd_pixel_in;
 wire        hd_pixel_opaque;
 wire        hd_line_armed;
 
-// One strobe per scaled output pixel. The linebuf registers hd_px_valid +
-// hd_pixel_in so they land the cycle AFTER the strobe (a BRAM read takes
-// one clk_vid), so final_ce_pixel follows the strobe window by one cycle
-// and the mux copies each HD pixel exactly when its valid/data pair is up.
-// (v3.1: the mux previously ran inside the strobe window, so pixel 0 of
-// every expanded group sampled pre-strobe valid=0 and showed the native
-// pixel while the last strobe's valid was never consumed — one native
-// pixel leaking into every group = fine vertical striping.)
-wire        HD_PX_STROBE = (scale_cnt != 4'd0);
-reg         ce_d = 1'b0;
+// One strobe per scaled output pixel — on ALTERNATING clk_vid cycles
+// (P2d-5). The linebuf's read pipeline (slot RAM -> CLUT -> valid flag)
+// delays each strobe's dot by exactly two cycles, and final_rgb_out latches
+// at the END of each valid cycle: with the old CONSECUTIVE-cycle strobe
+// window (cycles B,C of each 4-cycle native dot) the latches landed at the
+// ends of D and next-A — dot 2k was visible for ONE cycle and dot 2k+1 for
+// THREE. Every dot technically displayed, but as ragged 1px/3px columns:
+// the on-screen "vertical mess" (measured on device: all rows show 3-px
+// runs with 1-px breaks at a fixed mod-4 residue; the near field carried
+// no detail between 4-px boundaries at all). Strobes at vid_ph 1 and 3
+// space the latches two cycles apart, so each HD dot spans EXACTLY two
+// consecutive clk_vid — uniform 2-px columns, 512 dots per 1024-px line.
+reg  [2:0]  vid_ph = 3'd0;
+reg         ce_pix_d = 1'b0;
+wire        HD_PX_STROBE = (vid_ph != 3'd0) &&
+                           (m7_scale == 4'd4 || vid_ph[0]);
 
 always @(posedge clk_vid) begin
-	final_ce_pixel <= 1'b0;
-	ce_d           <= 1'b0;
+	ce_pix_d <= ce_pix;
 
-	// Reset X coordinate at HBLANK
-	if (~de_emu && hs_fix) begin
-		scale_cnt <= 0;
-	end
-	// Start generating HD pixels when the native core emits a pixel pulse
-	else if (ce_pix) begin
-		scale_cnt <= 1;
+	// Phase counter: locks to each native pixel (4 clk_vid per dot in the
+	// lores video the Mode 7 overlay runs in). vid_ph runs 1,2,3,4 across
+	// the group and parks at 0 through blanking, re-locking at every ce.
+	if (ce_pix) begin
+		vid_ph <= 3'd1;
+	end else if (vid_ph != 3'd0) begin
+		vid_ph <= (vid_ph == 3'd4) ? 3'd0 : vid_ph + 3'd1;
 	end
 
-	// Multiply the pixel: ce echoes the strobe window one cycle later
-	if (scale_cnt > 0) begin
-		ce_d <= 1'b1;
-		if (scale_cnt == m7_scale) begin
-			scale_cnt <= 0;
-		end else begin
-			scale_cnt <= scale_cnt + 1'd1;
-		end
-	end
-	final_ce_pixel <= ce_d;
+	// Data windows: each HD dot is stable for the two cycles after its
+	// latch (ends of the vid_ph-4 and vid_ph-2 cycles). One ce pulse per
+	// window keeps downstream samplers (scanlines) fed once per delivered
+	// dot; native lines get their single pulse at vid_ph 2, one cycle
+	// after the native latch below.
+	final_ce_pixel <= (vid_ph == 3'd2) ||
+	                  (hd_line_armed && (vid_ph == 3'd4));
 
 	// MULTIPLEXER: HD Mode 7 Buffer OR Native SNES Pixel.
 	// hd_px_valid (not a static enable) gates each pixel individually,
@@ -1436,9 +1437,11 @@ always @(posedge clk_vid) begin
 	// (measured on device: 1 native pixel per 4-px group = fine vertical
 	// striping). Non-valid cycles on armed lines hold the last HD pixel;
 	// only genuinely disarmed lines fall back to native.
+	// P2d-5: the native branch latches one cycle after ce_pix (r_out is
+	// stable by then), giving native pixels their full 4-cycle span.
 	if (hd_px_valid) begin
 		final_rgb_out <= hd_pixel_opaque ? hd_pixel_in : snes_rgb_out;
-	end else if (~ce_d && !hd_line_armed) begin
+	end else if (ce_pix_d && !hd_line_armed) begin
 		final_rgb_out <= snes_rgb_out;
 	end
 end
